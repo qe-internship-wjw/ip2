@@ -1,0 +1,10 @@
+/data
+/refs
+/notes
+/.vscode
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/

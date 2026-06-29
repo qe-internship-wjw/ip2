@@ -1,0 +1,67 @@
+# =============================================================================
+# Strategy configuration
+# =============================================================================
+
+# --- Data ---------------------------------------------------------------------
+data:
+  root: data/raw                  # directory holding the raw feather tables
+  cache: data/processed
+  price_glob: "price-001.feather"
+
+# --- Universe / data split ----------------------------------------------------
+universe:
+  # Sector set = banks + insurance (the tradable universe). Market set = all
+  sector_gics_sectors: [Financials]
+  include_banks: true
+  include_insurance: true
+  # Industry granularity: banks vs insurance, with life vs P&C
+  # split for insurers. Reconciled across GICS / SIC / FactSet codes.
+  industry_granularity: subsector       # one of: sector | industry | subsector
+  # Country granularity: home-country level.
+  country_granularity: home_country     # one of: region | home_country
+
+# --- Preprocessing / regularization (after factor generation) -----------------
+preprocess:
+  winsorize_limits: [0.01, 0.99]        # cross-sectional clip quantiles
+  standardize: zscore                   # cross-sectional z-score
+  group_by: date                        # cross-sections taken per date
+
+# --- Factors ------------------------------------------------------------------
+factors:
+  evaluate_in_local_currency: true      # evaluate stocks in own currency
+  nelson_siegel:
+    decay_tau: 1.37
+    use_curvature: false                # curvature impact unclear; off by default
+  yield_curve:
+    sensitivity_window_months: 36       # rolling regression window (level)
+
+# --- Validation ---------------------------------------------------------------
+validation:
+  ic:
+    method: rank                        # Rank IC
+    decay_lags: [1, 2, 3]               # IC decay horizons (t+1, t+2, t+3)
+    ir_shortlist_threshold: 0.3         # consistent IR > 0.3 shortlists a factor
+  quantiles: 5                          # quintile portfolios; long-short = Q1 - Q5
+  fama_macbeth:
+    newey_west_lags: 6                  # autocorrelation-adjusted t-stats
+  redundancy:
+    correlation_threshold: 0.6          # flag factor pairs with rho > 0.6
+    cluster_representative: best_ir      # best_ir | composite (equal-weight z)
+    competition_alpha_significance: 0.05
+    lasso: true                         # parsimony via lasso/elastic-net
+    schweinler_wigner_orthogonalize: true
+
+# --- Portfolio construction ---------------------------------------------------
+portfolio:
+  strategic_allocation: equal           # equal (1/K) | ir_weighted
+  risk_aversion: 2.0
+  covariance:
+    shrinkage: linear                   # linear (simple Ledoit-Wolf) | nonlinear
+    target: baseline                    # baseline | factor_model
+    ema_coefficient: 0.94               # slow-moving risk model
+
+# --- Backtest / evaluation ----------------------------------------------------
+backtest:
+  rebalancing_frequency_months: 3       # quarterly
+  hedge_broad_market_beta: true         # broad-index beta assumed hedged
+  metrics: [excess_return, max_drawdown, sharpe, information_ratio]
