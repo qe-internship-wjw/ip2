@@ -17,12 +17,44 @@ Tables:
 
 from __future__ import annotations
 
+from pathlib import Path
 
-def load_table(name, cfg):
+import polars as pl
+
+# Tables that live in a named subfolder under data/raw
+_SUBDIRS: dict[str, str] = {
+    "fundamental_master_extended": "Industry Fundamentals Data",
+    "zero_curve": "Zero Rates Data",
+}
+
+_ALL_TABLES = [
+    "price",
+    "security_master",
+    "fundamental_master",
+    "fundamental_master_extended",
+    "fx_rates",
+    "risk_free_rate",
+    "country_mapping",
+    "industry_mapping",
+    "zero_curve",
+]
+
+
+def _resolve_path(name: str, cfg) -> Path:
+    root = Path(cfg["data"]["root"])
+    if name == "price":
+        return root / cfg["data"]["price_glob"]
+    subdir = _SUBDIRS.get(name)
+    if subdir:
+        return root / subdir / f"{name}.feather"
+    return root / f"{name}.feather"
+
+
+def load_table(name: str, cfg) -> pl.LazyFrame:
     """Load a single raw table by logical name from the configured data root."""
-    raise NotImplementedError
+    return pl.scan_ipc(_resolve_path(name, cfg))
 
 
-def load_all(cfg):
+def load_all(cfg) -> dict[str, pl.LazyFrame]:
     """Load every raw table required by the pipeline into a dict of frames."""
-    raise NotImplementedError
+    return {name: load_table(name, cfg) for name in _ALL_TABLES}
