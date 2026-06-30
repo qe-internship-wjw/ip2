@@ -16,7 +16,7 @@ universe:
   include_insurance: true
   # Industry granularity: banks vs insurance, with life vs P&C
   # split for insurers. Reconciled across GICS / SIC / FactSet codes.
-  industry_granularity: subsector       # one of: sector | industry | subsector
+  industry_granularity: industry       # one of: sector | industry
   # Country granularity: home-country level.
   country_granularity: home_country     # one of: region | home_country
 
