@@ -18,7 +18,7 @@ universe:
   # split for insurers. Reconciled across GICS / SIC / FactSet codes.
   industry_granularity: industry       # one of: sector | industry
   # Country granularity: home-country level.
-  country_granularity: home_country     # one of: region | home_country
+  country_granularity: region     # one of: region | home_country
 
 # --- Preprocessing / regularization (after factor generation) -----------------
 preprocess:
