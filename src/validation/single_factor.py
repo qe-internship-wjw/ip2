@@ -1,30 +1,41 @@
 """Single-factor evaluation.
 
 1. Information Coefficient
-   - Rank IC between t exposure and t+1 excess return (net of non-style factors).
+   - Rank IC between t exposure and t+1 excess return. When non-style exposures
+     are supplied the forward return is first residualised against them, so the
+     IC measures the part of the return *not explained by non-style factors*.
    - IC decay at t+1, t+2, t+3 to inform rebalancing frequency / turnover.
    - Information ratio of the IC series; consistent IR > 0.3 shortlists a factor.
 2. Quantile Portfolio
-   - Sort universe into quintiles; equal- or cap-weighted forward returns.
-   - Monotonicity check and Long-Short (Q1-Q5) returns, t-stats, Sharpe.
+   - Sort the universe into quantiles; equal- or cap-weighted forward returns.
+   - Long-Short (Q1-Qn) returns with Newey-West t-stats and Sharpe.
 3. Fama-MacBeth
    - Period-by-period cross-sectional regressions of forward returns on scores.
    - Aggregate coefficients with Newey-West adjusted t-stats for autocorrelation.
+
+Cross-sectional regressions (IC residualisation, Fama-MacBeth) run as vectorised
+``polars-ols`` expressions ``.over("date")``; the time-series Newey-West (HAC)
+aggregation uses ``statsmodels`` (polars-ols has no HAC covariance).
 """
 
 from __future__ import annotations
 
 import numpy as np
 import polars as pl
+import polars_ols  # noqa: F401 -- registers the `.least_squares` expr namespace
+import statsmodels.api as sm
 
-from ._common import as_df, factor_columns, forward_returns
+from ._common import as_df, cross_sectional_residuals, factor_columns, forward_returns
 
 
-def rank_ic(scores, fwd_returns, lags=(1, 2, 3)):
+def rank_ic(scores, fwd_returns, lags=(1, 2, 3), nonstyle_exposures=None):
     """Rank IC series and IC decay across the given forward lags.
 
     For each factor and each lag, computes the per-date Spearman rank correlation
     between the time-``t`` exposure and the return realised ``lag`` periods ahead.
+    When ``nonstyle_exposures`` is given, the forward returns are first
+    residualised cross-sectionally against those factors (per date), so the IC is
+    *net of non-style risk* as specified in the Experiment Plan.
 
     Returns a long frame ``[date, factor, lag, ic]`` -- the IC time series whose
     behaviour across lags is the IC-decay curve.
@@ -32,6 +43,12 @@ def rank_ic(scores, fwd_returns, lags=(1, 2, 3)):
     scores = as_df(scores)
     fac_cols = factor_columns(scores)
     fwd, _ = forward_returns(fwd_returns, lags=lags)
+
+    if nonstyle_exposures is not None:
+        fwd = cross_sectional_residuals(
+            fwd, [f"_fwd{lag}" for lag in lags], nonstyle_exposures, by="date"
+        )
+
     df = scores.join(fwd, on=["stock_id", "date"], how="inner")
 
     frames = []
@@ -126,8 +143,19 @@ def quantile_portfolios(scores, fwd_returns, n=5, weighting="equal"):
     )
 
 
-def _series_stats(returns: np.ndarray) -> dict:
-    """Cumulative return, t-stat and (per-period) Sharpe of a return series."""
+def _hac_lags(n: int, override) -> int:
+    """Newey-West maxlags: caller override, else the ``4 (T/100)^(2/9)`` rule."""
+    lags = override if override is not None else max(1, int(4 * (n / 100) ** (2 / 9)))
+    return min(lags, n - 1)
+
+
+def _series_stats(returns: np.ndarray, newey_west_lags=None) -> dict:
+    """Cumulative return, Newey-West t-stat and (per-period) Sharpe of a series.
+
+    The t-statistic of the mean is computed with Newey-West (HAC) standard errors
+    (regressing the series on a constant), so serial correlation in the return
+    stream does not overstate significance.
+    """
     r = returns[np.isfinite(returns)]
     n = r.size
     if n < 2:
@@ -135,13 +163,18 @@ def _series_stats(returns: np.ndarray) -> dict:
                 "t_stat": np.nan, "sharpe": np.nan}
     mean, std = float(r.mean()), float(r.std(ddof=1))
     cum = float(np.prod(1.0 + r) - 1.0)
-    t_stat = mean / (std / np.sqrt(n)) if std > 0 else np.nan
-    sharpe = mean / std if std > 0 else np.nan
+    if std > 0:
+        fit = sm.OLS(r, np.ones(n)).fit(
+            cov_type="HAC", cov_kwds={"maxlags": _hac_lags(n, newey_west_lags)}
+        )
+        t_stat, sharpe = float(fit.tvalues[0]), mean / std
+    else:
+        t_stat = sharpe = np.nan
     return {"n": n, "mean": mean, "std": std, "cum_return": cum,
             "t_stat": t_stat, "sharpe": sharpe}
 
 
-def long_short_stats(ls_returns, n=5):
+def long_short_stats(ls_returns, n=5, newey_west_lags=None):
     """Metrics for the Long-Short (Q1 - Qn) portfolio.
 
     Accepts the quantile frame from :func:`quantile_portfolios` -- from which the
@@ -150,8 +183,8 @@ def long_short_stats(ls_returns, n=5):
     high = attractive) -- or a raw series of long-short returns.
 
     Returns a per-factor stats frame (quantile-frame input) or a single stats dict
-    (series input): number of periods, mean, std, cumulative return, t-stat and
-    per-period Sharpe.
+    (series input): number of periods, mean, std, cumulative return, Newey-West
+    t-stat and per-period Sharpe.
     """
     if isinstance(ls_returns, pl.DataFrame) and "quantile" in ls_returns.columns:
         keys = ["factor"] if "factor" in ls_returns.columns else []
@@ -160,30 +193,24 @@ def long_short_stats(ls_returns, n=5):
         wide = wide.with_columns(ls=(pl.col(low) - pl.col(high))).drop_nulls("ls")
 
         if not keys:
-            return _series_stats(wide["ls"].to_numpy())
+            return _series_stats(wide["ls"].to_numpy(), newey_west_lags)
         rows = []
         for key_vals, sub in wide.group_by(keys, maintain_order=True):
-            rows.append({"factor": key_vals[0], **_series_stats(sub["ls"].to_numpy())})
+            rows.append(
+                {"factor": key_vals[0], **_series_stats(sub["ls"].to_numpy(), newey_west_lags)}
+            )
         return pl.DataFrame(rows)
 
     s = ls_returns if isinstance(ls_returns, pl.Series) else pl.Series(list(ls_returns))
-    return _series_stats(s.to_numpy())
+    return _series_stats(s.to_numpy(), newey_west_lags)
 
 
 def fama_macbeth(scores, fwd_returns, newey_west_lags=None):
     """Aggregate cross-sectional regression premia with Newey-West t-stats.
 
-    Runs a per-date cross-sectional OLS of the next-period return on the factor
-    scores (with intercept), collects the coefficient time series, then tests each
-    mean premium against zero using Newey-West (HAC) standard errors to correct
-    for autocorrelation.
-
     Returns a frame ``[factor, mean_coef, t_stat, nw_se, n_periods]`` (``factor``
-    includes ``const``). ``newey_west_lags`` defaults to the rule of thumb
-    ``floor(4 (T/100)^(2/9))``.
+    includes ``const``).
     """
-    import statsmodels.api as sm
-
     scores = as_df(scores)
     fac_cols = factor_columns(scores)
     fwd, _ = forward_returns(fwd_returns, lags=(1,))
@@ -191,32 +218,34 @@ def fama_macbeth(scores, fwd_returns, newey_west_lags=None):
     df = df.drop_nulls(["_y", *fac_cols])
 
     names = ["const", *fac_cols]
-    coefs: dict[str, list[float]] = {name: [] for name in names}
-    for _, sub in df.group_by("date", maintain_order=True):
-        if sub.height <= len(fac_cols) + 1:  # too few obs to identify the slopes
-            continue
-        X = np.column_stack([np.ones(sub.height), sub.select(fac_cols).to_numpy()])
-        y = sub["_y"].to_numpy().astype(float)
-        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-        for i, name in enumerate(names):
-            coefs[name].append(float(beta[i]))
-
-    periods = len(coefs["const"])
-    if periods == 0:
+    if df.height == 0:
         return pl.DataFrame(
             {"factor": names, "mean_coef": [np.nan] * len(names),
              "t_stat": [np.nan] * len(names), "nw_se": [np.nan] * len(names),
              "n_periods": [0] * len(names)}
         )
 
-    if newey_west_lags is None:
-        newey_west_lags = max(1, int(4 * (periods / 100) ** (2 / 9)))
+    coef = (
+        pl.col("_y")
+        .least_squares.ols(
+            *fac_cols, mode="coefficients", add_intercept=True,
+            null_policy="drop", solve_method="svd",
+        )
+        .over("date")
+    )
+    per_date = df.select("date", _coef=coef).unique(subset="date", keep="first").sort("date")
 
     rows = []
     for name in names:
-        series = np.asarray(coefs[name])
+        series = per_date["_coef"].struct.field(name).to_numpy()
+        series = series[np.isfinite(series)]
+        periods = series.size
+        if periods < 2:
+            rows.append({"factor": name, "mean_coef": float(series.mean()) if periods else np.nan,
+                         "t_stat": np.nan, "nw_se": np.nan, "n_periods": periods})
+            continue
         fit = sm.OLS(series, np.ones(periods)).fit(
-            cov_type="HAC", cov_kwds={"maxlags": newey_west_lags}
+            cov_type="HAC", cov_kwds={"maxlags": _hac_lags(periods, newey_west_lags)}
         )
         rows.append(
             {"factor": name, "mean_coef": float(series.mean()),

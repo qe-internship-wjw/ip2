@@ -142,15 +142,13 @@ def _ir_lookup(ic_ir) -> dict:
 
 
 def lasso_select(fwd_returns, neutralized_scores, cfg):
-    """Elastic-net/lasso predictive regression; return surviving factors.
+    """Lasso predictive regression; return the surviving factors.
 
     Pools all (stock, date) observations into one predictive regression of the
     next-period return on every neutralized factor, standardizes the regressors so
-    the L1 penalty is scale-fair, and fits a cross-validated lasso. Factors whose
-    coefficient is driven to zero are dropped; the rest are the shortlist.
-
-    Uses scikit-learn's ``LassoCV`` when available, falling back to a
-    cross-validated statsmodels elastic net (``L1_wt=1``) otherwise.
+    the L1 penalty is scale-fair, and fits a cross-validated lasso
+    (scikit-learn ``LassoCV``). Factors whose coefficient is driven to zero are
+    dropped; the rest are the shortlist.
     """
     scores = as_df(neutralized_scores)
     cols = factor_columns(scores)
@@ -168,40 +166,12 @@ def lasso_select(fwd_returns, neutralized_scores, cfg):
     Xz = np.zeros_like(X)
     Xz[:, keep] = (X[:, keep] - mu[keep]) / sd[keep]
 
-    coef = _lasso_coefficients(Xz, y - y.mean(), cfg)
+    coef = _lasso_coefficients(Xz, y - y.mean())
     return [c for c, b, k in zip(cols, coef, keep) if k and abs(b) > 0.0]
 
 
-def _lasso_coefficients(X: np.ndarray, y: np.ndarray, cfg) -> np.ndarray:
-    """Fitted lasso coefficients (sklearn if present, else statsmodels CV)."""
-    try:
-        from sklearn.linear_model import LassoCV
+def _lasso_coefficients(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Cross-validated lasso coefficients via scikit-learn ``LassoCV``."""
+    from sklearn.linear_model import LassoCV
 
-        return LassoCV(cv=5, n_alphas=50, max_iter=10000).fit(X, y).coef_
-    except ImportError:
-        import statsmodels.api as sm
-
-        n = X.shape[0]
-        rng = np.arange(n)
-        folds = np.array_split(rng, 5)
-        alphas = np.logspace(-4, 0, 25)
-
-        best_alpha, best_mse = alphas[0], np.inf
-        for alpha in alphas:
-            errs = []
-            for k in range(5):
-                test = folds[k]
-                train = np.setdiff1d(rng, test)
-                params = (
-                    sm.OLS(y[train], X[train])
-                    .fit_regularized(alpha=alpha, L1_wt=1.0)
-                    .params
-                )
-                errs.append(np.mean((y[test] - X[test] @ params) ** 2))
-            mse = float(np.mean(errs))
-            if mse < best_mse:
-                best_alpha, best_mse = alpha, mse
-
-        return np.asarray(
-            sm.OLS(y, X).fit_regularized(alpha=best_alpha, L1_wt=1.0).params
-        )
+    return LassoCV(cv=5, n_alphas=50, max_iter=10000).fit(X, y).coef_

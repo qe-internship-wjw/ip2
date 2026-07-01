@@ -63,3 +63,62 @@ def forward_returns(fwd_returns, lags=(1,), ret_col=None):
         for lag in lags
     ]
     return df.select("stock_id", "date", *fwd), ret_col
+
+
+def design_matrix(exposures, by="date"):
+    """Coerce non-style exposures into a numeric regressor design matrix.
+
+    Numeric columns pass through; non-numeric membership labels (e.g. a
+    ``region_code`` / ``industry`` column) are one-hot encoded with a reference
+    level dropped (``drop_first``) so the dummies are not collinear with the
+    regression intercept. Returns ``(frame, regressor_columns)`` with
+    ``stock_id`` / ``by`` retained.
+    """
+    exposures = as_df(exposures)
+    skip = {"stock_id", by}
+    cat_cols = [
+        c for c, dtype in exposures.schema.items()
+        if c not in skip and not dtype.is_numeric()
+    ]
+    if cat_cols:
+        exposures = exposures.to_dummies(columns=cat_cols, drop_first=True)
+    reg_cols = [
+        c for c, dtype in exposures.schema.items()
+        if c not in skip and dtype.is_numeric()
+    ]
+    return exposures, reg_cols
+
+
+def cross_sectional_residuals(frame, target_cols, exposures, by="date"):
+    """Replace each ``target_cols`` column with its per-``by`` OLS residual.
+
+    Runs a cross-sectional regression (one per ``by`` group, intercept added) of
+    each target on the non-style ``exposures`` design and keeps the residuals --
+    the neutralised series. This is a single vectorised ``polars-ols`` expression
+    per target evaluated ``.over(by)`` (no per-date Python loop), with the SVD
+    solver so rank-deficient cross-sections (e.g. a date missing a dummy level)
+    stay numerically stable. Non-target columns are preserved; a row whose target
+    or regressors are null yields a null residual.
+    """
+    import polars_ols  # noqa: F401 -- registers the `.least_squares` namespace
+
+    frame = as_df(frame)
+    design, reg_cols = design_matrix(exposures, by)
+    joined = frame.join(
+        design.select("stock_id", by, *reg_cols), on=["stock_id", by], how="left"
+    )
+    resid = [
+        pl.col(c)
+        .least_squares.ols(
+            *reg_cols,
+            mode="residuals",
+            add_intercept=True,
+            null_policy="drop",
+            solve_method="svd",
+        )
+        .over(by)
+        .alias(c)
+        for c in target_cols
+    ]
+    keep = [c for c in frame.columns if c not in target_cols]
+    return joined.select(*keep, *resid)
