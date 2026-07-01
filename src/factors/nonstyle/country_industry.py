@@ -1,22 +1,31 @@
-"""Country and (sub)industry factors via factor-mimicking portfolios.
+"""Country and industry factors via hierarchical factor-mimicking portfolios.
 
-The design is hierarchical, selected by ``universe.country_granularity``:
+Both are demeaned partitions of the structural-factor tree (see ``_hierarchy``):
+each portfolio is the cap-weighted (USD-sized) excess return of a group of stocks
+minus its parent's return, so the children of any node sum to zero when weighted
+by USD market cap (orthogonal to the level above).
 
-* ``region``  -- one portfolio per region (``region_code`` from
-  ``country_mapping``: APAC / EMEA / AMER). Each is the region's cap-weighted
-  excess return minus the overall market return, so the region portfolios sum to
-  zero when market-cap weighted (orthogonal to the market factor).
-* ``home_country`` (a.k.a. country) -- one portfolio per country, each the
-  country's cap-weighted excess return minus its *region's* return, so the
-  countries within a region sum to zero when cap-weighted (orthogonal to that
-  region's factor).
+* **Country** -- selected by ``universe.country_granularity``:
+    ``region``        one portfolio per region (APAC / EMEA / AMER), relative to
+                      the whole market. Columns ``region:<code>``.
+    ``home_country``  one portfolio per country, relative to its *region*.
+                      Columns ``country:<code>``.
+* **Industry** -- two flat layers:
+    1. ``tradeable`` (banks + insurance, per :func:`universe.sector_set`) vs the
+       ``rest`` of the universe, relative to the whole market. Columns
+       ``universe:tradeable`` / ``universe:rest``.
+    2. the sector/industry split *within* the tradeable universe, relative to the
+       tradeable set's return. Columns ``sector:<label>`` or ``industry:<label>``
+       per ``universe.industry_granularity`` (2 or 3 children respectively).
 """
 
 from __future__ import annotations
 
 import polars as pl
 
+from ...universe import industry_labels, sector_set
 from ..base import Applicability, Factor, FactorKind, register
+from ._hierarchy import relative_factor, wide_factors
 
 
 @register
@@ -30,45 +39,60 @@ class Country(Factor):
     def compute(self, panel, cfg):
         """Hierarchical country/region factor-mimicking portfolio returns.
 
-        Returns a wide table with one ``date`` column and one column per region
-        (``region`` granularity) or per country (``home_country`` granularity),
-        sorted chronologically. Within each date the columns sum to zero when
-        weighted by the group's USD market cap.
+        Returns a wide table with a ``date`` column and one ``region:<code>``
+        (``region`` granularity) or ``country:<code>`` (``home_country``
+        granularity) column per group, sorted chronologically.
         """
-        granularity = cfg["universe"]["country_granularity"]
-
         lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
 
-        if granularity == "region":
-            child, parent = "region_code", None
+        if cfg["universe"]["country_granularity"] == "region":
+            child, parent_keys, prefix = "region_code", (), "region"
         else:
-            child, parent = "country_code", "region_code"
-            lf = lf.filter(pl.col("country_code").is_not_null())
+            child, parent_keys, prefix = "country_code", ("region_code",), "country"
 
-        # Cap-weighted excess return per group (numerator/denominator kept split
-        # so the parent baseline can be re-aggregated from the same pieces).
-        group_keys = ["date", child] if parent is None else ["date", parent, child]
-        comp = lf.group_by(group_keys).agg(
-            _w=(pl.col("excess_return") * pl.col("mcap_usd")).sum(),
-            _m=pl.col("mcap_usd").sum(),
+        return wide_factors(relative_factor(lf, child, parent_keys), child, prefix)
+
+
+@register
+class Industry(Factor):
+    name = "Industry"
+    shorthand = "IND"
+    sleeve = "NonStyle"
+    kind = FactorKind.SYSTEMATIC
+    applicability = Applicability.ALL_FINANCIALS
+
+    def compute(self, panel, cfg):
+        """Hierarchical industry factor-mimicking portfolio returns.
+
+        Returns a wide table with a ``date`` column plus, across the two layers,
+        ``universe:{tradeable,rest}`` and ``{sector|industry}:<label>`` columns,
+        sorted chronologically.
+        """
+        lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
+
+        # ── Layer 1: tradeable vs rest, relative to the whole market ──────────
+        # Tradeable membership is a per-stock property (static classification +
+        # a populated sector metric), so tag it via a semi-join on stock_id.
+        tradeable_ids = (
+            sector_set(lf, cfg)
+            .select("stock_id")
+            .unique()
+            .with_columns(_tradeable=pl.lit(True))
+        )
+        lf = lf.join(tradeable_ids, on="stock_id", how="left").with_columns(
+            _membership=pl.when(pl.col("_tradeable").fill_null(False))
+            .then(pl.lit("tradeable"))
+            .otherwise(pl.lit("rest"))
+        )
+        layer1 = wide_factors(
+            relative_factor(lf, "_membership"), "_membership", "universe"
         )
 
-        # Baseline return the group is demeaned against: the whole market (per
-        # date) for regions, or the parent region (per date) for countries.
-        base_keys = ["date"] if parent is None else ["date", parent]
-        base = comp.group_by(base_keys).agg(
-            _wb=pl.col("_w").sum(),
-            _mb=pl.col("_m").sum(),
-        ).with_columns(_r_base=pl.col("_wb") / pl.col("_mb"))
+        # ── Layer 2: sector/industry within the tradeable universe ────────────
+        # Defined only on the tradeable set, relative to its own return.
+        granularity = cfg["universe"].get("industry_granularity", "industry")
+        tradeable = industry_labels(lf.filter(pl.col("_membership") == "tradeable"), cfg)
+        layer2 = wide_factors(relative_factor(tradeable, "industry"), "industry", granularity)
 
-        comp = (
-            comp.with_columns(_r=pl.col("_w") / pl.col("_m"))
-            .join(base.select(*base_keys, "_r_base"), on=base_keys, how="left")
-            .with_columns(_factor=pl.col("_r") - pl.col("_r_base"))
-        )
-
-        return (
-            comp.collect()
-            .pivot(values="_factor", index="date", on=child)
-            .sort("date")
-        )
+        # Whole-market dates are a superset of tradeable dates, so left-join.
+        return layer1.join(layer2, on="date", how="left").sort("date")
