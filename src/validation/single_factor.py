@@ -49,10 +49,12 @@ def rank_ic(
     those factors (per date), so the IC is *net of non-style risk* as specified in
     the Experiment Plan.
 
-    A sector factor is null outside its sub-universe, so its per-date IC is formed
-    only over the sub-universe where it is defined (the ``drop_nulls`` below).
+    A sector factor is null outside its sub-universe, so its per-period IC is
+    formed only over the sub-universe where it is defined (the ``drop_nulls``
+    below). Cross-sections are grouped on the common ``period`` key (securities'
+    period-end days differ under staggered trading calendars).
 
-    Returns a long frame ``[date, factor, lag, ic]`` -- the IC time series whose
+    Returns a long frame ``[period, factor, lag, ic]`` -- the IC time series whose
     behaviour across lags is the IC-decay curve.
     """
     scores = as_df(scores)
@@ -60,8 +62,13 @@ def rank_ic(
     fwd = forward_returns(fwd_returns, lags=lags, target_col=target_col, period_months=period_months)
 
     if nonstyle_exposures is not None:
+        # Sample each security's loadings at its rebalance date, then residualise
+        # the forward returns per period (the common cross-section key).
+        exposures = fwd.select("stock_id", "date", "period").join(
+            as_df(nonstyle_exposures), on=["stock_id", "date"], how="left"
+        )
         fwd = cross_sectional_residuals(
-            fwd, [f"_fwd{lag}" for lag in lags], nonstyle_exposures, by="date"
+            fwd, [f"_fwd{lag}" for lag in lags], exposures, by="period"
         )
 
     df = scores.join(fwd, on=["stock_id", "date"], how="inner")
@@ -72,13 +79,17 @@ def rank_ic(
         for f in fac_cols:
             frames.append(
                 df.drop_nulls([f, fwd_col])
-                .group_by("date")
+                .group_by("period")
                 .agg(ic=pl.corr(f, fwd_col, method="spearman"))
                 .with_columns(factor=pl.lit(f), lag=pl.lit(lag))
             )
 
-    return pl.concat(frames).select("date", "factor", "lag", "ic").sort(
-        "factor", "lag", "date"
+    # A degenerate cross-section (constant factor / <2 points) yields NaN from
+    # pl.corr; map it to null so downstream mean/std/IR treat it as missing.
+    return (
+        pl.concat(frames)
+        .select("period", "factor", "lag", pl.col("ic").fill_nan(None))
+        .sort("factor", "lag", "period")
     )
 
 
@@ -175,13 +186,13 @@ def _fama_macbeth_premia(df, fac_cols, newey_west_lags):
             *fac_cols, mode="coefficients", add_intercept=True,
             null_policy="drop", solve_method="svd",
         )
-        .over("date")
+        .over("period")
     )
-    per_date = df.select("date", _coef=coef).unique(subset="date", keep="first").sort("date")
+    per_period = df.select("period", _coef=coef).unique(subset="period", keep="first").sort("period")
 
     rows = []
     for name in names:
-        series = per_date["_coef"].struct.field(name).to_numpy()
+        series = per_period["_coef"].struct.field(name).to_numpy()
         series = series[np.isfinite(series)]
         periods = series.size
         if periods < 2:

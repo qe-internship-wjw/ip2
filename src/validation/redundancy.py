@@ -45,9 +45,11 @@ def average_correlation(scores, threshold=0.6):
             per_date = df.drop_nulls([a, b]).group_by("date").agg(
                 rho=pl.corr(a, b)
             )
+            # Drop NaN (degenerate single-date cross-sections) before averaging;
+            # otherwise a NaN poisons the mean and slips through the flag filter.
             records.append(
                 {"factor_a": a, "factor_b": b,
-                 "rho": per_date["rho"].drop_nulls().mean()}
+                 "rho": per_date["rho"].fill_nan(None).drop_nulls().mean()}
             )
 
     pairs = pl.DataFrame(
@@ -187,6 +189,8 @@ def lasso_select(
 
 def _lasso_survivors(df, cols):
     """Standardized cross-validated lasso on one dense sub-universe panel."""
+    if df.height == 0 or not cols:
+        return []
     X = df.select(cols).to_numpy()
     y = df["_y"].to_numpy().astype(float)
 
@@ -196,19 +200,22 @@ def _lasso_survivors(df, cols):
     Xz = np.zeros_like(X)
     Xz[:, keep] = (X[:, keep] - mu[keep]) / sd[keep]
 
-    coef = _lasso_coefficients(Xz, y - y.mean(), df["date"].to_numpy())
+    coef = _lasso_coefficients(Xz, y - y.mean(), df["period"].to_numpy())
     return [c for c, b, k in zip(cols, coef, keep) if k and abs(b) > 0.0]
 
 
-def _lasso_coefficients(X: np.ndarray, y: np.ndarray, dates: np.ndarray) -> np.ndarray:
-    """Cross-validated lasso coefficients, cross-validating by date.
+def _lasso_coefficients(X: np.ndarray, y: np.ndarray, periods: np.ndarray) -> np.ndarray:
+    """Cross-validated lasso coefficients, cross-validating by period.
 
-    Folds group whole rebalancing dates together (``GroupKFold`` on ``dates``) so
-    a date's cross-section never straddles the train/test split.
+    Folds group whole rebalancing periods together (``GroupKFold`` on ``periods``)
+    so a period's cross-section never straddles the train/test split -- otherwise
+    contemporaneous rows leak and the alpha selection is over-optimistic.
     """
     from sklearn.linear_model import LassoCV
     from sklearn.model_selection import GroupKFold
 
-    n_splits = min(5, len(np.unique(dates)))
-    cv = list(GroupKFold(n_splits=n_splits).split(X, y, dates))
+    n_splits = min(5, len(np.unique(periods)))
+    if n_splits < 2:
+        return np.zeros(X.shape[1])
+    cv = list(GroupKFold(n_splits=n_splits).split(X, y, periods))
     return LassoCV(cv=cv, alphas=50, max_iter=10000).fit(X, y).coef_

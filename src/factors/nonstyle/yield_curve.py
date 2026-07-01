@@ -105,12 +105,16 @@ def fit_nelson_siegel(zero_curve, cfg):
 def attach_nelson_siegel(panel, ns_params):
     """Left-join the fitted NS ``level``/``slope``/``curvature`` onto the panel.
 
+    The panel's ``currency_code`` is Categorical while the fitted ``currency`` is
+    a plain string, so both join keys are cast to ``Utf8`` to match.
     """
     lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
     nsp = ns_params.lazy() if isinstance(ns_params, pl.DataFrame) else ns_params
 
-    out = lf.join(
-        nsp.select("date", "currency", "level", "slope", "curvature"),
+    out = lf.with_columns(pl.col("currency_code").cast(pl.Utf8)).join(
+        nsp.select(
+            "date", pl.col("currency").cast(pl.Utf8), "level", "slope", "curvature"
+        ),
         left_on=["date", "currency_code"],
         right_on=["date", "currency"],
         how="left",

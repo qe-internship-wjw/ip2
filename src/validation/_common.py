@@ -74,9 +74,11 @@ def forward_returns(fwd_returns, lags=(1,), target_col="excess_return", period_m
     then holds the compounded return realised ``lag`` *periods* ahead
     (``shift(-lag)`` within each security).
 
-    Returns a frame ``[stock_id, date, _fwd{lag}...]`` keyed on the period-end
-    dates; an inner join to a daily ``scores`` frame therefore keeps exactly the
-    rebalancing rows.
+    Returns ``[stock_id, date, period, _fwd{lag}...]``: ``date`` is the security's
+    period-end trading day (join it to a daily ``scores`` frame to keep exactly the
+    rebalancing rows) and ``period`` is the common calendar bucket -- group
+    cross-sections on ``period``, since securities' period-end days differ under
+    staggered trading calendars.
     """
     df = as_df(fwd_returns).sort("stock_id", "date")
     periodic = (
@@ -93,7 +95,12 @@ def forward_returns(fwd_returns, lags=(1,), target_col="excess_return", period_m
         pl.col("_ret").shift(-lag).over("stock_id").alias(f"_fwd{lag}")
         for lag in lags
     ]
-    return periodic.select("stock_id", pl.col("_date").alias("date"), *fwd)
+    return periodic.select(
+        "stock_id",
+        pl.col("_date").alias("date"),
+        pl.col("_period").alias("period"),
+        *fwd,
+    )
 
 
 def design_matrix(exposures, by="date"):
