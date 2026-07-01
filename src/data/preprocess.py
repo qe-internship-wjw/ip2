@@ -1,10 +1,23 @@
 """
 Regularization: cleaning, winsorization, standardization.
+
+Winsorization / imputation / standardization are **sub-universe aware**. Banks and
+insurers carry mutually-exclusive (and several jointly-computable) metrics.
 """
 
 from __future__ import annotations
 
 import polars as pl
+
+from ..factors.base import Applicability, registry
+
+# Sector applicability -> the ``industry``-label prefix that selects its
+# sub-universe (``universe.industry_labels``: "bank", "insurance", "insurance_*").
+# All-financials factors are absent here: they use the whole cross-section.
+_APPLICABILITY_PREFIX = {
+    Applicability.BANKS: "bank",
+    Applicability.INSURANCE: "insurance",
+}
 
 
 def clean(panel, cfg):
@@ -54,91 +67,155 @@ def clean(panel, cfg):
     return panel
 
 
-def _value_columns(scores, by):
-    """Numeric factor-score columns to regularize (excludes ids / the group key).
-
-    Works on both eager and lazy frames.
-    """
-    schema = (
-        scores.collect_schema()
+def _columns(scores):
+    """Column names of an eager or lazy frame."""
+    return (
+        scores.collect_schema().names()
         if isinstance(scores, pl.LazyFrame)
-        else scores.schema
+        else scores.columns
     )
-    skip = {"stock_id", by}
-    return [c for c, dtype in schema.items() if c not in skip and dtype.is_numeric()]
 
 
-def winsorize(scores, limits, by=None):
+def _factor_columns(scores):
+    """Registered factor-score columns present in ``scores`` (keyed by shorthand).
+
+    Cross-references the frame's columns against the factor registry rather than
+    duck-typing numeric columns, so metadata (``mcap_usd``, the ``industry``
+    label, ...) is never regularized as if it were a signal.
+    """
+    known = registry()
+    return [c for c in _columns(scores) if c in known]
+
+
+def _subuniverse_mask(col: str, universe_col: str):
+    """Boolean expr for the sub-universe factor ``col`` is defined on, or ``None``.
+
+    ``None`` means the factor is all-financials and uses the whole cross-section.
+    """
+    prefix = _APPLICABILITY_PREFIX.get(registry()[col].applicability)
+    return None if prefix is None else pl.col(universe_col).str.starts_with(prefix)
+
+
+def _require_universe_col(scores, factors, universe_col):
+    """Ensure the membership label is present when any sector factor needs it."""
+    needs_split = any(
+        registry()[c].applicability in _APPLICABILITY_PREFIX for c in factors
+    )
+    if needs_split and universe_col not in _columns(scores):
+        raise ValueError(
+            f"preprocess needs the '{universe_col}' sub-universe label column to "
+            "partition Bank/Insurer factors; otherwise sector medians and z-scores "
+            "leak across the structurally-disjoint sub-universes. Attach it via "
+            "universe.industry_labels before regularizing."
+        )
+
+
+def winsorize(scores, limits, by=None, universe_col="industry"):
     """Clip cross-sectional outliers to the given quantile limits.
 
     For each factor column, values below the ``limits[0]`` quantile or above the
-    ``limits[1]`` quantile of the cross-section (the ``by`` group, default
-    ``"date"``) are clipped to those bounds. Nulls are preserved (imputed later by
-    :func:`fill_missing`). Uses ``.over(by)`` so no information crosses dates.
+    ``limits[1]`` quantile of its cross-section (the ``by`` group, default
+    ``"date"``) are clipped to those bounds. The cross-section is restricted to the
+    factor's sub-universe (bank / insurer / all-financials): the quantiles come
+    only from applicable rows, and rows outside the sub-universe are set to null.
+    Nulls are preserved (imputed later by :func:`fill_missing`). Uses ``.over(by)``
+    so no information crosses dates.
     """
     by = by or "date"
     lo, hi = float(limits[0]), float(limits[1])
-    exprs = [
-        pl.col(c)
-        .clip(
-            lower_bound=pl.col(c).quantile(lo).over(by),
-            upper_bound=pl.col(c).quantile(hi).over(by),
-        )
-        .alias(c)
-        for c in _value_columns(scores, by)
-    ]
-    return scores.with_columns(exprs)
+    factors = _factor_columns(scores)
+    _require_universe_col(scores, factors, universe_col)
+
+    def clip_expr(c: str) -> pl.Expr:
+        mask = _subuniverse_mask(c, universe_col)
+        if mask is None:
+            lob = pl.col(c).quantile(lo).over(by)
+            hib = pl.col(c).quantile(hi).over(by)
+            return pl.col(c).clip(lower_bound=lob, upper_bound=hib).alias(c)
+        lob = pl.col(c).filter(mask).quantile(lo).over(by)
+        hib = pl.col(c).filter(mask).quantile(hi).over(by)
+        clipped = pl.col(c).clip(lower_bound=lob, upper_bound=hib)
+        return pl.when(mask).then(clipped).otherwise(None).alias(c)
+
+    return scores.with_columns([clip_expr(c) for c in factors])
 
 
-def fill_missing(scores, by=None):
+def fill_missing(scores, by=None, universe_col="industry"):
     """Impute missing factor scores with the cross-sectional median.
 
     The median of the same-date cross-section is a neutral fill that introduces no
     look-ahead (it never reaches across dates, unlike a forward-fill) and, once
     scores are standardized, sits at ~0 -- i.e. a missing stock takes no active
-    bet on that factor.
+    bet on that factor. The cross-section is restricted to the factor's
+    sub-universe, so a Bank's missing Bank-factor is filled with the *Bank* median
+    (never the Insurer median); rows outside the sub-universe stay null.
     """
     by = by or "date"
-    exprs = [
-        pl.col(c).fill_null(pl.col(c).median().over(by)).alias(c)
-        for c in _value_columns(scores, by)
-    ]
-    return scores.with_columns(exprs)
+    factors = _factor_columns(scores)
+    _require_universe_col(scores, factors, universe_col)
+
+    def fill_expr(c: str) -> pl.Expr:
+        mask = _subuniverse_mask(c, universe_col)
+        if mask is None:
+            return pl.col(c).fill_null(pl.col(c).median().over(by)).alias(c)
+        median = pl.col(c).filter(mask).median().over(by)
+        return (
+            pl.when(mask).then(pl.col(c).fill_null(median)).otherwise(None).alias(c)
+        )
+
+    return scores.with_columns([fill_expr(c) for c in factors])
 
 
-def standardize(scores, by=None):
+def standardize(scores, by=None, universe_col="industry"):
     """Cross-sectional z-score per factor: the factor's z_k.
 
     Subtracts the cross-sectional mean and divides by the cross-sectional standard
-    deviation within each ``by`` group. Degenerate cross-sections (zero or null
-    dispersion) map to 0 rather than inf/nan.
+    deviation within each ``by`` group, restricted to the factor's sub-universe so
+    a sector factor is standardized only against its own sub-universe. Degenerate
+    cross-sections (zero or null dispersion) map to 0 rather than inf/nan; rows
+    outside the sub-universe stay null.
     """
     by = by or "date"
+    factors = _factor_columns(scores)
+    _require_universe_col(scores, factors, universe_col)
 
     def zscore(c: str) -> pl.Expr:
-        mean = pl.col(c).mean().over(by)
-        std = pl.col(c).std().over(by)
-        return (
+        mask = _subuniverse_mask(c, universe_col)
+        if mask is None:
+            mean = pl.col(c).mean().over(by)
+            std = pl.col(c).std().over(by)
+            return (
+                pl.when(std.is_null() | (std == 0))
+                .then(pl.lit(0.0))
+                .otherwise((pl.col(c) - mean) / std)
+                .alias(c)
+            )
+        mean = pl.col(c).filter(mask).mean().over(by)
+        std = pl.col(c).filter(mask).std().over(by)
+        core = (
             pl.when(std.is_null() | (std == 0))
             .then(pl.lit(0.0))
             .otherwise((pl.col(c) - mean) / std)
-            .alias(c)
         )
+        return pl.when(mask).then(core).otherwise(None).alias(c)
 
-    return scores.with_columns([zscore(c) for c in _value_columns(scores, by)])
+    return scores.with_columns([zscore(c) for c in factors])
 
 
 def regularize(scores, cfg):
     """Run winsorize -> fill_missing -> standardize on raw factor scores.
 
-    Reads ``preprocess.winsorize_limits`` and ``preprocess.group_by`` from config
-    (defaults: ``[0.01, 0.99]`` and ``"date"``).
+    Reads ``preprocess.winsorize_limits``, ``preprocess.group_by`` and
+    ``preprocess.universe_col`` from config (defaults: ``[0.01, 0.99]``, ``"date"``
+    and ``"industry"``). The input must carry the ``universe_col`` sub-universe
+    label whenever any bank/insurer factor is present (see :func:`fill_missing`).
     """
     pcfg = cfg["preprocess"]
     limits = pcfg.get("winsorize_limits", [0.01, 0.99])
     by = pcfg.get("group_by", "date")
+    universe_col = pcfg.get("universe_col", "industry")
 
-    scores = winsorize(scores, limits, by=by)
-    scores = fill_missing(scores, by=by)
-    scores = standardize(scores, by=by)
+    scores = winsorize(scores, limits, by=by, universe_col=universe_col)
+    scores = fill_missing(scores, by=by, universe_col=universe_col)
+    scores = standardize(scores, by=by, universe_col=universe_col)
     return scores
