@@ -54,21 +54,91 @@ def clean(panel, cfg):
     return panel
 
 
+def _value_columns(scores, by):
+    """Numeric factor-score columns to regularize (excludes ids / the group key).
+
+    Works on both eager and lazy frames.
+    """
+    schema = (
+        scores.collect_schema()
+        if isinstance(scores, pl.LazyFrame)
+        else scores.schema
+    )
+    skip = {"stock_id", by}
+    return [c for c, dtype in schema.items() if c not in skip and dtype.is_numeric()]
+
+
 def winsorize(scores, limits, by=None):
-    """Clip cross-sectional outliers to the given quantile limits."""
-    raise NotImplementedError
+    """Clip cross-sectional outliers to the given quantile limits.
+
+    For each factor column, values below the ``limits[0]`` quantile or above the
+    ``limits[1]`` quantile of the cross-section (the ``by`` group, default
+    ``"date"``) are clipped to those bounds. Nulls are preserved (imputed later by
+    :func:`fill_missing`). Uses ``.over(by)`` so no information crosses dates.
+    """
+    by = by or "date"
+    lo, hi = float(limits[0]), float(limits[1])
+    exprs = [
+        pl.col(c)
+        .clip(
+            lower_bound=pl.col(c).quantile(lo).over(by),
+            upper_bound=pl.col(c).quantile(hi).over(by),
+        )
+        .alias(c)
+        for c in _value_columns(scores, by)
+    ]
+    return scores.with_columns(exprs)
 
 
 def fill_missing(scores, by=None):
-    """Fill missing factor scores (e.g. cross-sectional median)."""
-    raise NotImplementedError
+    """Impute missing factor scores with the cross-sectional median.
+
+    The median of the same-date cross-section is a neutral fill that introduces no
+    look-ahead (it never reaches across dates, unlike a forward-fill) and, once
+    scores are standardized, sits at ~0 -- i.e. a missing stock takes no active
+    bet on that factor.
+    """
+    by = by or "date"
+    exprs = [
+        pl.col(c).fill_null(pl.col(c).median().over(by)).alias(c)
+        for c in _value_columns(scores, by)
+    ]
+    return scores.with_columns(exprs)
 
 
 def standardize(scores, by=None):
-    """Cross-sectional z-score (optionally within group), the factor's z_k."""
-    raise NotImplementedError
+    """Cross-sectional z-score per factor: the factor's z_k.
+
+    Subtracts the cross-sectional mean and divides by the cross-sectional standard
+    deviation within each ``by`` group. Degenerate cross-sections (zero or null
+    dispersion) map to 0 rather than inf/nan.
+    """
+    by = by or "date"
+
+    def zscore(c: str) -> pl.Expr:
+        mean = pl.col(c).mean().over(by)
+        std = pl.col(c).std().over(by)
+        return (
+            pl.when(std.is_null() | (std == 0))
+            .then(pl.lit(0.0))
+            .otherwise((pl.col(c) - mean) / std)
+            .alias(c)
+        )
+
+    return scores.with_columns([zscore(c) for c in _value_columns(scores, by)])
 
 
 def regularize(scores, cfg):
-    """Run winsorize -> fill_missing -> standardize on raw factor scores."""
-    raise NotImplementedError
+    """Run winsorize -> fill_missing -> standardize on raw factor scores.
+
+    Reads ``preprocess.winsorize_limits`` and ``preprocess.group_by`` from config
+    (defaults: ``[0.01, 0.99]`` and ``"date"``).
+    """
+    pcfg = cfg["preprocess"]
+    limits = pcfg.get("winsorize_limits", [0.01, 0.99])
+    by = pcfg.get("group_by", "date")
+
+    scores = winsorize(scores, limits, by=by)
+    scores = fill_missing(scores, by=by)
+    scores = standardize(scores, by=by)
+    return scores
