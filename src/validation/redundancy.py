@@ -15,7 +15,14 @@ from collections import defaultdict
 import numpy as np
 import polars as pl
 
-from ._common import as_df, factor_columns, forward_returns
+from ._common import (
+    SUBUNIVERSES,
+    applicable_factor_columns,
+    as_df,
+    factor_columns,
+    forward_returns,
+    subuniverse_mask,
+)
 
 
 def average_correlation(scores, threshold=0.6):
@@ -141,22 +148,45 @@ def _ir_lookup(ic_ir) -> dict:
     raise TypeError("ic_ir must be a dict or a polars DataFrame.")
 
 
-def lasso_select(fwd_returns, neutralized_scores, cfg):
-    """Lasso predictive regression; return the surviving factors.
+def lasso_select(
+    fwd_returns,
+    neutralized_scores,
+    cfg,
+    target_col="excess_return",
+    universe_col="industry",
+):
+    """Lasso predictive regression per sub-universe; return the surviving factors.
 
-    Pools all (stock, date) observations into one predictive regression of the
-    next-period return on every neutralized factor, standardizes the regressors so
-    the L1 penalty is scale-fair, and fits a cross-validated lasso
-    (scikit-learn ``LassoCV``). Factors whose coefficient is driven to zero are
-    dropped; the rest are the shortlist.
+    Penalized regression is run **within each sub-universe**. Within a sub-universe the design is
+    dense, the regressors are standardized so the L1 penalty is scale-fair, and a
+    cross-validated lasso (``LassoCV``) is fit. Factors driven to zero are dropped;
+    a factor survives if it survives in *any* sub-universe.
+
+    Returns the shortlist as a de-duplicated list of factor shorthands.
     """
     scores = as_df(neutralized_scores)
-    cols = factor_columns(scores)
-    fwd, _ = forward_returns(fwd_returns, lags=(1,))
-    df = scores.join(
-        fwd.rename({"_fwd1": "_y"}), on=["stock_id", "date"], how="inner"
-    ).drop_nulls(["_y", *cols])
+    if universe_col not in scores.columns:
+        raise ValueError(
+            f"lasso_select needs the '{universe_col}' sub-universe label to split "
+            "Banks vs Insurers; otherwise the disjoint sector factors leave no "
+            "dense rows. Attach it via universe.industry_labels."
+        )
+    period = int(cfg.get("backtest", {}).get("rebalancing_frequency_months", 3))
+    fwd = forward_returns(fwd_returns, lags=(1,), target_col=target_col, period_months=period)
+    df = scores.join(fwd.rename({"_fwd1": "_y"}), on=["stock_id", "date"], how="inner")
 
+    survivors: list[str] = []
+    for sub, applic in SUBUNIVERSES.items():
+        cols = applicable_factor_columns(scores, applic)
+        sub_df = df.filter(subuniverse_mask(sub, universe_col)).drop_nulls(["_y", *cols])
+        survivors.extend(_lasso_survivors(sub_df, cols))
+
+    # A factor may survive in one or both sub-universes; keep first-seen order.
+    return list(dict.fromkeys(survivors))
+
+
+def _lasso_survivors(df, cols):
+    """Standardized cross-validated lasso on one dense sub-universe panel."""
     X = df.select(cols).to_numpy()
     y = df["_y"].to_numpy().astype(float)
 
@@ -166,12 +196,19 @@ def lasso_select(fwd_returns, neutralized_scores, cfg):
     Xz = np.zeros_like(X)
     Xz[:, keep] = (X[:, keep] - mu[keep]) / sd[keep]
 
-    coef = _lasso_coefficients(Xz, y - y.mean())
+    coef = _lasso_coefficients(Xz, y - y.mean(), df["date"].to_numpy())
     return [c for c, b, k in zip(cols, coef, keep) if k and abs(b) > 0.0]
 
 
-def _lasso_coefficients(X: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Cross-validated lasso coefficients via scikit-learn ``LassoCV``."""
-    from sklearn.linear_model import LassoCV
+def _lasso_coefficients(X: np.ndarray, y: np.ndarray, dates: np.ndarray) -> np.ndarray:
+    """Cross-validated lasso coefficients, cross-validating by date.
 
-    return LassoCV(cv=5, n_alphas=50, max_iter=10000).fit(X, y).coef_
+    Folds group whole rebalancing dates together (``GroupKFold`` on ``dates``) so
+    a date's cross-section never straddles the train/test split.
+    """
+    from sklearn.linear_model import LassoCV
+    from sklearn.model_selection import GroupKFold
+
+    n_splits = min(5, len(np.unique(dates)))
+    cv = list(GroupKFold(n_splits=n_splits).split(X, y, dates))
+    return LassoCV(cv=cv, alphas=50, max_iter=10000).fit(X, y).coef_
