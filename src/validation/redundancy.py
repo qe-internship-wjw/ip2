@@ -30,16 +30,7 @@ def select_cluster_representatives(clusters, ic_ir, method="best_ir"):
     raise NotImplementedError
 
 
-def factor_competition(ls_returns, others):
-    """Regress one factor's L/S returns on the others; return alpha and its t-stat."""
-    raise NotImplementedError
-
 
 def lasso_select(fwd_returns, neutralized_scores, cfg):
     """Elastic-net/lasso predictive regression; return surviving factors."""
-    raise NotImplementedError
-
-
-def schweinler_wigner_orthogonalize(scores):
-    """Symmetric (Loewdin/SW) orthogonalization minimizing signal distortion."""
     raise NotImplementedError

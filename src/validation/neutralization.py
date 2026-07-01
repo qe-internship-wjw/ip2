@@ -2,8 +2,7 @@
 
 Ensure style factors are not implicitly betting on non-style risks. Run
 cross-sectional OLS of raw factor scores on the non-style factors (market,
-country/industry, yield curve, currency); the residuals are the neutralized
-factor scores.
+country/industry); the residuals are the neutralized factor scores.
 """
 
 from __future__ import annotations
