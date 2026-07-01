@@ -1,8 +1,9 @@
 """Factor neutralization.
 
 Ensure style factors are not implicitly betting on non-style risks. For each date
-we run a cross-sectional OLS of the raw factor scores on the non-style factors
-(market / country / industry) and keep the residuals as the neutralized scores.
+we run a cross-sectional OLS of the raw factor scores on the non-style loadings
+(market / country / industry / yield-curve betas) and keep the residuals as the
+neutralized scores.
 """
 
 from __future__ import annotations
@@ -19,9 +20,8 @@ def neutralize(raw_scores, nonstyle_exposures, by="date"):
     raw_scores : frame with ``stock_id``, ``date`` and one or more style-score
         columns.
     nonstyle_exposures : frame with ``stock_id``, ``date`` and the non-style
-        regressors (market / country / industry). Numeric loadings are used
-        as-is; label columns are one-hot encoded (an intercept is always added,
-        so it captures the market level).
+        per-security loadings (market / country / industry / yield-curve betas);
+        an intercept is always added, so it captures the market level.
     by : cross-section key (default ``"date"``).
 
     Returns

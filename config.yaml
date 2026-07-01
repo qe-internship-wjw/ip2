@@ -34,6 +34,8 @@ factors:
     use_curvature: false                # curvature impact unclear; off by default
   yield_curve:
     sensitivity_window_months: 36       # rolling regression window (level)
+  loadings:
+    window_months: 24                   # rolling window for structural-factor betas
 
 # --- Validation ---------------------------------------------------------------
 validation:
