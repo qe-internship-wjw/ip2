@@ -3,7 +3,7 @@
 Three distinct stages, one module each:
 
     neutralization  regress raw style scores on non-style factors; keep residuals
-    single_factor   Rank IC / IC decay / IR, quantile backtests, Fama-MacBeth
+    single_factor   Rank IC / IC decay / IR, Fama-MacBeth
     redundancy      correlation flags, clustering, factor competition, lasso,
                     Schweinler-Wigner orthogonalization
 
