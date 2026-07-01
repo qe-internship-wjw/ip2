@@ -73,6 +73,11 @@ def build_panel(raw, cfg):
         raw["industry_mapping"],
     )
     panel = panel.join(fx, on=["currency_code", "date"], how="left")
+    # Precompute USD market cap now that fx is attached; many factors weight by
+    # it, so materialize it once here rather than recomputing per factor.
+    panel = panel.with_columns(
+        mcap_usd=pl.col("security_mcap_local") * pl.col("fx_to_usd")
+    )
     panel = attach_fundamentals(
         panel,
         raw["fundamental_master"],

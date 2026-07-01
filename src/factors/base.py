@@ -41,7 +41,7 @@ class Factor:
     name: str = ""
     shorthand: str = ""
     sleeve: str = ""
-    kind: FactorKind = FactorKind.BEHAVIOURAL
+    kind: FactorKind = FactorKind.SYSTEMATIC
     applicability: Applicability = Applicability.ALL_FINANCIALS
 
     def compute(self, panel, cfg):
