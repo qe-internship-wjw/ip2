@@ -25,14 +25,8 @@ def fit_nelson_siegel(zero_curve, cfg):
     """Estimate level/slope/curvature per date per sovereign curve.
 
     For every ``date`` x ``currency`` pair the Nelson-Siegel curve is fitted to
-    ``zero_rate`` against the parsed tenor (in years) by OLS on the betas, with
-    the decay ``tau`` held fixed at the configured hyperparameter. The three
-    fitted betas map directly to the term-structure factors:
-
-        level     = beta0   (long-run rate)
-        slope     = beta1   (short-end vs long-end)
-        curvature = beta2   (medium-term hump)
-
+    ``zero_rate`` against tenor, with the decay ``tau`` fixed.
+    
     Parameters
     ----------
     zero_curve : pl.LazyFrame | pl.DataFrame
