@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import polars as pl
 
+from ..factors.nonstyle.yield_curve import attach_nelson_siegel, fit_nelson_siegel
+
 
 def attach_fundamentals(prices, fundamentals, fundamentals_extended):
     """As-of join fundamentals onto prices using observation_date <= date.
@@ -84,4 +86,9 @@ def build_panel(raw, cfg):
         raw["fundamental_master_extended"],
     )
     panel = to_excess_return(panel, raw["risk_free_rate"])
+
+    # Summarise each sovereign curve (Nelson-Siegel) and attach parameters.
+    ns_params = fit_nelson_siegel(raw["zero_curve"], cfg)
+    panel = attach_nelson_siegel(panel, ns_params)
+    
     return panel

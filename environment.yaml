@@ -24,3 +24,5 @@ dependencies:
   - pytest>=8.0
   - linearmodels
   - cvxpy
+  - pip:
+    - polars-ols
