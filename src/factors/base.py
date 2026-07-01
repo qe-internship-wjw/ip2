@@ -59,5 +59,7 @@ def register(cls: type[Factor]) -> type[Factor]:
 
 
 def registry() -> dict[str, type[Factor]]:
-    """Return the registered factors keyed by shorthand."""
+    """Return the registered factors keyed by shorthand (auto-populating first)."""
+    from . import style  # noqa: F401  (registers the style factors)
+    from .nonstyle import country_industry, market, yield_curve  # noqa: F401
     return dict(_REGISTRY)
