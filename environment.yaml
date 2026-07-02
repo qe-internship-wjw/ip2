@@ -24,5 +24,10 @@ dependencies:
   - pytest>=8.0
   - linearmodels
   - cvxpy
+  - jupyterlab==4.4.1
+  - jupyter-collaboration==4.0.2
+  - jupyter-mcp-tools>=0.1.4
+  - ipykernel
+  - pycrdt
   - pip:
     - polars-ols
