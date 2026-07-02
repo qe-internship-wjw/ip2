@@ -22,15 +22,13 @@ universe:
 
 # --- Preprocessing / regularization (after factor generation) -----------------
 preprocess:
-  winsorize_limits: [0.01, 0.99]        # cross-sectional clip quantiles
-  standardize: zscore                   # cross-sectional z-score
-  group_by: period                      # cross-sections taken per rebalancing period
-                                        # (scores are downsampled to rebalance dates
-                                        #  and carry a common `period` key)
+  winsorize_limits: [0.01, 0.99]        
+  standardize: zscore                   
+  group_by: period                      
 
 # --- Factors ------------------------------------------------------------------
 factors:
-  evaluate_in_local_currency: true      # evaluate stocks in own currency
+  evaluate_in_local_currency: true
   nelson_siegel:
     decay_tau: 1.37
     use_curvature: false                # curvature impact unclear; off by default
@@ -42,18 +40,14 @@ factors:
 # --- Validation ---------------------------------------------------------------
 validation:
   ic:
-    method: rank                        # Rank IC
-    decay_lags: [1, 2, 3]               # IC decay horizons (t+1, t+2, t+3)
-    ir_shortlist_threshold: 0.3         # consistent IR > 0.3 shortlists a factor
-  quantiles: 5                          # quintile portfolios; long-short = Q1 - Q5
-  fama_macbeth:
-    newey_west_lags: 6                  # autocorrelation-adjusted t-stats
+    method: rank                        
+    decay_lags: [1, 2, 3, 4]            # IC decay horizons
+    ir_shortlist_threshold: 0.3         
+  quantiles: 10                         
   redundancy:
     correlation_threshold: 0.6          # flag factor pairs with rho > 0.6
     cluster_representative: best_ir      # best_ir | composite (equal-weight z)
-    competition_alpha_significance: 0.05
     lasso: true                         # parsimony via lasso/elastic-net
-    schweinler_wigner_orthogonalize: true
 
 # --- Portfolio construction ---------------------------------------------------
 portfolio:
