@@ -28,9 +28,11 @@ from ._common import (
 def average_correlation(scores, threshold=0.6):
     """Mean cross-sectional factor correlation; flag pairs above threshold.
 
-    For every factor pair, the Pearson correlation is computed within each date's
-    cross-section and averaged over dates (a time-series average of cross-sectional
-    correlations, so no cross-date leakage).
+    For every factor pair, the Pearson correlation is computed within each
+    cross-section and averaged over time (a time-series average of cross-sectional
+    correlations, so no cross-period leakage). The cross-section key is ``period``
+    when present (one cross-section per rebalance -- so staggered period-end dates
+    are not split), else ``date``.
 
     Returns ``(pairs, flagged)``: ``pairs`` is ``[factor_a, factor_b, rho]`` for
     all pairs; ``flagged`` is the subset with ``|rho| > threshold``, most
@@ -38,18 +40,17 @@ def average_correlation(scores, threshold=0.6):
     """
     df = as_df(scores)
     cols = factor_columns(df)
+    by = "period" if "period" in df.columns else "date"
 
     records = []
     for i, a in enumerate(cols):
         for b in cols[i + 1:]:
-            per_date = df.drop_nulls([a, b]).group_by("date").agg(
-                rho=pl.corr(a, b)
-            )
-            # Drop NaN (degenerate single-date cross-sections) before averaging;
+            per_xs = df.drop_nulls([a, b]).group_by(by).agg(rho=pl.corr(a, b))
+            # Drop NaN (degenerate single-member cross-sections) before averaging;
             # otherwise a NaN poisons the mean and slips through the flag filter.
             records.append(
                 {"factor_a": a, "factor_b": b,
-                 "rho": per_date["rho"].fill_nan(None).drop_nulls().mean()}
+                 "rho": per_xs["rho"].fill_nan(None).drop_nulls().mean()}
             )
 
     pairs = pl.DataFrame(

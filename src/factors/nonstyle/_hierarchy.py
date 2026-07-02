@@ -13,16 +13,17 @@
     +- industry               relative to the tradeable set  (Industry)
 
 A security's *exposure* to a structural factor is its rolling time-series beta on
-that factor's return (:func:`stock_loadings`), so every non-style factor exposes a
-per-security ``[stock_id, date, <shorthand>]`` loading -- the same shape as a
-style score, which lets the pipeline treat all factors uniformly.
+that factor's return (:func:`stock_loadings`). The beta is estimated on **monthly**
+observations (daily returns compounded to calendar months), since the portfolio
+rebalances quarterly and a monthly beta is both cheaper and steadier than a daily
+one. Every non-style factor still exposes a per-security ``[stock_id, date,
+<shorthand>]`` loading (one row per stock-month) -- the same shape as a style
+score, which lets the pipeline treat all factors uniformly.
 """
 
 from __future__ import annotations
 
 import polars as pl
-
-_YEAR = 252  # trading days
 
 
 def cap_weighted_return(lf, keys):
@@ -71,10 +72,9 @@ def relative_factor(lf, child, parent_keys=()):
 
 
 def _loading_window(cfg) -> tuple[int, int]:
-    """Rolling-beta window / min-periods (trading days) from ``factors.loadings``."""
+    """Rolling-beta window / min-periods, in **months**, from ``factors.loadings``."""
     months = cfg["factors"].get("loadings", {}).get("window_months", 24)
-    window = max(_YEAR, round(months / 12 * _YEAR))
-    return window, window // 2
+    return months, max(4, months // 2)
 
 
 def stock_loadings(panel, factor_long, name, cfg, join_on):
@@ -82,8 +82,14 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
 
     ``factor_long`` carries a factor-mimicking portfolio return keyed by
     ``join_on`` (``["date"]`` for the market, ``["date", <member>]`` for
-    country/industry). It is aligned to each ``(stock, date)`` and a rolling
-    time-series OLS gives the security's loading, exposed lazily as ``name``.
+    country/industry). It is aligned to each ``(stock, date)``, both series are
+    compounded to **calendar-month** returns, and a rolling time-series OLS over
+    the trailing ``factors.loadings.window_months`` months gives the security's
+    loading, exposed lazily as ``name`` at each stock-month's last trading date.
+
+    ``panel`` should already be the tradeable subset: only tradeable securities
+    carry a loading (they are the only ones we hold), while ``factor_long`` is
+    built from the full universe upstream.
     """
     import polars_ols  # noqa: F401 -- registers the `.least_squares` namespace
 
@@ -91,13 +97,24 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
     window, min_periods = _loading_window(cfg)
     keys = [k for k in join_on if k != "date"]
 
-    aligned = (
+    # Resample stock and factor returns to calendar months (compounded), so the
+    # rolling OLS runs on ~1/21 as many rows as the daily version and the beta
+    # matches the quarterly rebalancing horizon.
+    monthly = (
         lf.select("stock_id", "date", "excess_return", *keys)
         .join(factor_long.rename({"_factor": "_x"}), on=join_on, how="left")
+        .with_columns(_period=pl.col("date").dt.truncate("1mo"))
         .sort("stock_id", "date")
+        .group_by("stock_id", "_period")
+        .agg(
+            _date=pl.col("date").last(),
+            _ret=(pl.col("excess_return") + 1.0).product() - 1.0,
+            _x=(pl.col("_x") + 1.0).product() - 1.0,
+        )
+        .sort("stock_id", "_period")
     )
     beta = (
-        pl.col("excess_return")
+        pl.col("_ret")
         .least_squares.rolling_ols(
             "_x", window_size=window, min_periods=min_periods,
             add_intercept=True, mode="coefficients", null_policy="drop",
@@ -105,7 +122,8 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
         .over("stock_id")
         .struct.field("_x")
     )
-    return aligned.select(
-        "stock_id", "date",
+    return monthly.select(
+        "stock_id",
+        pl.col("_date").alias("date"),
         pl.when(beta.is_finite()).then(beta).otherwise(None).alias(name),
     )

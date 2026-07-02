@@ -24,7 +24,9 @@ universe:
 preprocess:
   winsorize_limits: [0.01, 0.99]        # cross-sectional clip quantiles
   standardize: zscore                   # cross-sectional z-score
-  group_by: date                        # cross-sections taken per date
+  group_by: period                      # cross-sections taken per rebalancing period
+                                        # (scores are downsampled to rebalance dates
+                                        #  and carry a common `period` key)
 
 # --- Factors ------------------------------------------------------------------
 factors:

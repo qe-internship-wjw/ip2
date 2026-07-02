@@ -67,6 +67,40 @@ def clean(panel, cfg):
     return panel
 
 
+def rebalance_grid(panel, cfg):
+    """Per (security, rebalancing period) the period-end trading date + period key.
+
+    Buckets each security's trading days into non-overlapping calendar periods of
+    ``backtest.rebalancing_frequency_months`` (quarterly by default) and keeps the
+    last trading day of each -- the rebalance date. Returns a lazy ``[stock_id,
+    date, period]`` frame: the grid used by :func:`to_rebalance` to downsample the
+    daily style scores and the monthly loadings to the rebalancing cross-sections.
+    """
+    pm = int(cfg.get("backtest", {}).get("rebalancing_frequency_months", 3))
+    lf = panel if isinstance(panel, pl.LazyFrame) else panel.lazy()
+    return (
+        lf.select("stock_id", "date")
+        .with_columns(period=pl.col("date").dt.truncate(f"{pm}mo"))
+        .group_by("stock_id", "period")
+        .agg(date=pl.col("date").max())
+        .select("stock_id", "date", "period")
+    )
+
+
+def to_rebalance(frame, grid):
+    """Downsample a ``[stock_id, date, ...]`` frame to the rebalance cross-sections.
+
+    Inner-joins ``frame`` to :func:`rebalance_grid` on ``[stock_id, date]`` so only
+    period-end rows survive, and attaches the common ``period`` key. Grouping the
+    downstream cross-sectional steps (regularize / neutralize) on ``period`` -- not
+    the raw ``date`` -- keeps every security of a rebalancing period in one
+    cross-section despite staggered trading calendars. Returns a lazy frame.
+    """
+    lf = frame if isinstance(frame, pl.LazyFrame) else frame.lazy()
+    g = grid if isinstance(grid, pl.LazyFrame) else grid.lazy()
+    return lf.join(g, on=["stock_id", "date"], how="inner")
+
+
 def _columns(scores):
     """Column names of an eager or lazy frame."""
     return (
