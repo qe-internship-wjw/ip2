@@ -31,17 +31,17 @@ def main():
     args = parse_args()
     cfg = config_mod.load(args.config)
 
-    # 1. Data
+    # 1. Data + universe (two lazy panels)
     # raw = loaders.load_all(cfg)
-    # panel = joins.build_panel(raw, cfg)
-    # panel = accounting.restate(panel, cfg)
-    # panel = preprocess.clean(panel, cfg)
+    # market_frame = preprocess.clean(joins.build_market_frame(raw, cfg), cfg)  # full universe, light
+    # sector_panel = preprocess.clean(joins.build_sector_panel(raw, cfg), cfg)  # tradeable, rich
+    #   build_market_frame feeds the cap-weighted factor-mimicking portfolios
+    #   (Market/Country over all stocks) and carries a `tradeable` flag so loadings
+    #   attach only to the ~2k tradeable names; build_sector_panel pre-filters to
+    #   tradeable before the fundamentals as-of join.
 
-    # 2. Universe
-    # market = universe.market_set(panel, cfg)
-    # sector = universe.sector_set(panel, cfg)
-
-    # 3. Factors -> 4. Validation -> 5. Portfolio -> 6. Backtest
+    # 2. Factors: non-style loadings on market_frame; style scores on sector_panel
+    # 3. Validation -> 4. Portfolio -> 5. Backtest
     # ...
 
     raise NotImplementedError("Pipeline stages not yet implemented.")

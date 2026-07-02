@@ -62,6 +62,59 @@ _BANK_METRIC      = "net_interest_margin"
 _INSURANCE_METRIC = "insurance_premium_ltm"
 
 
+def tradable_ids(raw, cfg):
+    """Tradeable-universe ``stock_id`` set (banks + insurance), from reference tables.
+
+    Same membership gate as :func:`sector_set`, but evaluated on the small
+    reference / fundamentals tables (48k security rows, ~8.5M fundamental rows)
+    rather than the 150M-row price panel.
+
+    Returns a lazy ``[stock_id]`` frame of the tradeable securities.
+    """
+    ucfg = cfg["universe"]
+    gics_keep = []
+    if ucfg.get("include_banks", True):
+        gics_keep.append(_GICS_BANKS)
+    if ucfg.get("include_insurance", True):
+        gics_keep.append(_GICS_INSURANCE)
+
+    known_factset = list(_FACTSET_TO_SECTOR.keys())
+    bank_factset = [k for k, v in _FACTSET_TO_SECTOR.items() if v == "bank"]
+    insurance_factset = [k for k, v in _FACTSET_TO_SECTOR.items() if v == "insurance"]
+
+    # "metric ever populated" per security, straight off the fundamentals tables.
+    has_bank = (
+        raw["fundamental_master_extended"]
+        .group_by("stock_id")
+        .agg(_has_bank=pl.col(_BANK_METRIC).is_not_null().any())
+    )
+    has_ins = (
+        raw["fundamental_master"]
+        .group_by("stock_id")
+        .agg(_has_ins=pl.col(_INSURANCE_METRIC).is_not_null().any())
+    )
+
+    ref = (
+        raw["security_master"].select("stock_id", "gics_industry_name")
+        .join(raw["industry_mapping"].select("stock_id", "factset_industry_name"),
+              on="stock_id", how="left")
+        .join(has_bank, on="stock_id", how="left")
+        .join(has_ins, on="stock_id", how="left")
+    )
+
+    keep = (
+        pl.col("gics_industry_name").is_in(gics_keep)
+        & pl.col("factset_industry_name").is_in(known_factset)
+        & (
+            (pl.col("factset_industry_name").is_in(bank_factset)
+             & pl.col("_has_bank").fill_null(False))
+            | (pl.col("factset_industry_name").is_in(insurance_factset)
+               & pl.col("_has_ins").fill_null(False))
+        )
+    )
+    return ref.filter(keep).select("stock_id").unique()
+
+
 def market_set(panel, cfg):
     """All securities used for estimating market/country/industry factors."""
     return panel
