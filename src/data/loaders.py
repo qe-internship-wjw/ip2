@@ -39,6 +39,49 @@ _ALL_TABLES = [
     "zero_curve",
 ]
 
+# Canonical categorical schema. Identifier / code / classification columns are
+# semantically categorical and must load as ``pl.Categorical``
+_CATEGORICAL_COLS: dict[str, list[str]] = {
+    "price": ["stock_id"],
+    "security_master": [
+        "stock_id",
+        "name",
+        "country_code",
+        "currency_code",
+        "bloomberg_composite_ticker",
+        "gics_sector_name",
+        "gics_industry_group_name",
+        "gics_industry_name",
+    ],
+    "fundamental_master": ["stock_id"],
+    "fundamental_master_extended": ["stock_id"],
+    "fx_rates": ["currency_code"],
+    "risk_free_rate": ["country_code"],
+    "country_mapping": ["country_code", "region_code"],
+    "industry_mapping": [
+        "stock_id",
+        "sic_code",
+        "sic_name",
+        "factset_industry_code",
+        "factset_industry_name",
+    ],
+    "zero_curve": ["currency"],
+}
+
+
+def _cast_categoricals(name: str, lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Cast the table's canonical categorical columns to ``pl.Categorical``.
+
+    Only columns actually present in the frame are cast, so a schema change in a
+    raw feather degrades gracefully rather than raising.
+    """
+    wanted = _CATEGORICAL_COLS.get(name, [])
+    if not wanted:
+        return lf
+    present = set(lf.collect_schema().names())
+    casts = [pl.col(c).cast(pl.Categorical) for c in wanted if c in present]
+    return lf.with_columns(casts) if casts else lf
+
 
 def _resolve_path(name: str, cfg) -> Path:
     root = Path(cfg["data"]["root"])
@@ -52,7 +95,7 @@ def _resolve_path(name: str, cfg) -> Path:
 
 def load_table(name: str, cfg) -> pl.LazyFrame:
     """Load a single raw table by logical name from the configured data root."""
-    return pl.scan_ipc(_resolve_path(name, cfg))
+    return _cast_categoricals(name, pl.scan_ipc(_resolve_path(name, cfg)))
 
 
 def load_all(cfg) -> dict[str, pl.LazyFrame]:

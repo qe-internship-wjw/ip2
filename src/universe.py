@@ -115,8 +115,12 @@ def industry_labels(panel, cfg):
     granularity = cfg["universe"].get("industry_granularity", "industry")
     mapping = _GRANULARITY_MAP[granularity]
 
+    # ``industry`` is intentionally a plain String (not Categorical) due to downstream
+    # string operations like str.contains()
+
     return panel.with_columns(
         pl.col("factset_industry_name")
-        .replace(mapping, default=None)
+        .cast(pl.Utf8)
+        .replace_strict(mapping, default=None)
         .alias("industry")
     )
