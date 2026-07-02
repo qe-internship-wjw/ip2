@@ -21,7 +21,7 @@ from __future__ import annotations
 import polars as pl
 
 from ..base import Applicability, Factor, FactorKind, register
-from ._hierarchy import relative_factor, stock_loadings
+from ._hierarchy import expand_by_group, relative_factor, stock_loadings
 
 
 @register
@@ -33,11 +33,12 @@ class Country(Factor):
     applicability = Applicability.ALL_FINANCIALS
 
     def compute(self, panel, cfg):
-        """Per-security rolling beta on its country/region factor return.
+        """Per-country/region betas + region dummies, one column block per group.
 
         The country/region return is cap-weighted over *all* securities in that
         country/region (:func:`joins.build_market_frame`); loadings are estimated
-        only for the tradeable names.
+        only for the tradeable names, then expanded per group so each country/region
+        carries its own slope (``beta_{group}``) and baseline (``is_{group}``).
         """
         lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
 
@@ -48,7 +49,8 @@ class Country(Factor):
 
         long = relative_factor(lf, child, parent_keys)
         tradeable = lf.filter(pl.col("tradeable"))
-        out = stock_loadings(tradeable, long, self.shorthand, cfg, ["date", child])
+        loadings = stock_loadings(tradeable, long, self.shorthand, cfg, ["date", child])
+        out = expand_by_group(loadings, self.shorthand, child)
         return out.collect() if isinstance(panel, pl.DataFrame) else out
 
 
@@ -61,16 +63,19 @@ class Industry(Factor):
     applicability = Applicability.ALL_FINANCIALS
 
     def compute(self, panel, cfg):
-        """Per-security rolling beta on its industry factor return.
+        """Per-industry betas + industry dummies, one column block per group.
 
         Industry is handled hierarchically: within the tradeable financials set the
         industry return is taken relative to that set's aggregate, isolating the
         industry (bank vs insurer) tilt. The ``tradeable`` flag and ``industry``
         label are precomputed on the market frame (:func:`joins.build_market_frame`),
-        so no re-filtering against the universe is needed here.
+        so no re-filtering against the universe is needed here. The beta is expanded
+        per industry so each carries its own slope (``beta_{group}``) and baseline
+        (``is_{group}``).
         """
         lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
         tradeable = lf.filter(pl.col("tradeable"))
         long = relative_factor(tradeable, "industry")
-        out = stock_loadings(tradeable, long, self.shorthand, cfg, ["date", "industry"])
+        loadings = stock_loadings(tradeable, long, self.shorthand, cfg, ["date", "industry"])
+        out = expand_by_group(loadings, self.shorthand, "industry")
         return out.collect() if isinstance(panel, pl.DataFrame) else out

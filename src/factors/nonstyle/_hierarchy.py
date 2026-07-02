@@ -16,9 +16,8 @@ A security's *exposure* to a structural factor is its rolling time-series beta o
 that factor's return (:func:`stock_loadings`). The beta is estimated on **monthly**
 observations (daily returns compounded to calendar months), since the portfolio
 rebalances quarterly and a monthly beta is both cheaper and steadier than a daily
-one. Every non-style factor still exposes a per-security ``[stock_id, date,
-<shorthand>]`` loading (one row per stock-month) -- the same shape as a style
-score, which lets the pipeline treat all factors uniformly.
+one. Each stock-month carries the beta *and the group it belongs to* (the country /
+industry the beta was estimated against).
 """
 
 from __future__ import annotations
@@ -87,6 +86,12 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
     the trailing ``factors.loadings.window_months`` months gives the security's
     loading, exposed lazily as ``name`` at each stock-month's last trading date.
 
+    The grouping member(s) in ``join_on`` (e.g. ``region_code`` / ``industry``,
+    everything but ``date``) are carried through onto each stock-month -- the
+    security's group at the period end -- so the loading can be expanded per group
+    downstream (:func:`expand_by_group`). The market case (``join_on == ["date"]``)
+    has no member key and stays a single ``name`` column.
+
     ``panel`` should already be the tradeable subset: only tradeable securities
     carry a loading (they are the only ones we hold), while ``factor_long`` is
     built from the full universe upstream.
@@ -99,7 +104,8 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
 
     # Resample stock and factor returns to calendar months (compounded), so the
     # rolling OLS runs on ~1/21 as many rows as the daily version and the beta
-    # matches the quarterly rebalancing horizon.
+    # matches the quarterly rebalancing horizon. The group key(s) ride along as the
+    # month's last observed value, aligned with ``_date``.
     monthly = (
         lf.select("stock_id", "date", "excess_return", *keys)
         .join(factor_long.rename({"_factor": "_x"}), on=join_on, how="left")
@@ -110,6 +116,7 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
             _date=pl.col("date").last(),
             _ret=(pl.col("excess_return") + 1.0).product() - 1.0,
             _x=(pl.col("_x") + 1.0).product() - 1.0,
+            *[pl.col(k).last() for k in keys],
         )
         .sort("stock_id", "_period")
     )
@@ -125,5 +132,41 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
     return monthly.select(
         "stock_id",
         pl.col("_date").alias("date"),
+        *keys,
         pl.when(beta.is_finite()).then(beta).otherwise(None).alias(name),
     )
+
+
+def expand_by_group(loadings, name, group_col):
+    """Expand a stacked structural loading into per-group betas + one-hot dummies.
+
+    * ``beta_{g}`` -- the security's ``name`` beta when it belongs to ``g`` else 0,
+      giving each group its own slope.
+    * ``is_{g}``   -- a 0/1 dummy absorbing ``g``'s baseline mean.
+
+    Returns a lazy ``[stock_id, date, beta_*..., is_*...]`` frame (the raw stacked
+    beta and the group label are consumed).
+    """
+    lf = loadings.lazy() if isinstance(loadings, pl.DataFrame) else loadings
+
+    # Only the distinct group labels are materialised (projection pushdown prunes
+    # the beta), so the frame stays lazy for the join/collect the caller controls.
+    groups = (
+        lf.select(pl.col(group_col).cast(pl.Utf8).alias("_g"))
+        .drop_nulls()
+        .unique()
+        .collect()
+        .get_column("_g")
+        .sort()
+        .to_list()
+    )
+    g = pl.col(group_col).cast(pl.Utf8)
+    betas = [
+        pl.when(g == grp).then(pl.col(name)).otherwise(0.0).alias(f"beta_{grp}")
+        for grp in groups
+    ]
+    dummies = [
+        pl.when(g == grp).then(1.0).otherwise(0.0).alias(f"is_{grp}")
+        for grp in groups[1:]  # reference-cell coding: hold out the first level
+    ]
+    return lf.select("stock_id", "date", *betas, *dummies)
