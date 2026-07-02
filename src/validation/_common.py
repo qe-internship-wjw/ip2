@@ -104,24 +104,34 @@ def forward_returns(fwd_returns, lags=(1,), target_col="excess_return", period_m
 
 
 def design_matrix(exposures, by="date"):
-    """Registered non-style loadings of ``exposures`` as the regressor matrix.
+    """The non-style regressor matrix: every non-identifier column of ``exposures``.
 
-    Returns ``(frame, regressor_columns)``; regressors are the registered factor
-    columns (the per-security structural loadings), selected via the registry.
+    Returns ``(frame, regressor_columns)``. The ``exposures`` frame is purpose-built
+    as the neutralization design -- the market beta plus the *expanded* country and
+    industry blocks (a distinct ``beta_{group}`` slope per country/industry group and
+    one-hot ``is_{group}`` dummies; see
+    :func:`src.factors.nonstyle._hierarchy.expand_by_group`). So every column that is
+    not an identifier (``stock_id`` / ``date`` / ``period`` / the ``by`` key) is a
+    regressor.
     """
     exposures = as_df(exposures)
-    return exposures, factor_columns(exposures, extra_skip=(by,))
+    skip = set(ID_COLS) | {by, "period"}
+    reg_cols = [c for c in exposures.columns if c not in skip]
+    return exposures, reg_cols
 
 
 def cross_sectional_residuals(frame, target_cols, exposures, by="date"):
     """Replace each ``target_cols`` column with its per-``by`` OLS residual.
 
     Runs a cross-sectional regression (one per ``by`` group, intercept added) of
-    each target on the non-style loadings and keeps the residuals -- the
-    neutralised series. A single vectorised ``polars-ols`` expression per target
-    evaluated ``.over(by)`` (no per-date loop), with the SVD solver so
-    rank-deficient cross-sections stay stable. Non-target columns are preserved; a
-    row whose target or regressors are null yields a null residual.
+    each target on the non-style regressors (:func:`design_matrix` -- the market
+    beta, the per-group country/industry betas, and their one-hot dummies) and keeps
+    the residuals: the neutralised series, net of both the group risk *slopes* and
+    the group *baselines*. A single vectorised ``polars-ols`` expression per target
+    evaluated ``.over(by)`` (no per-date loop), with the SVD solver so rank-deficient
+    cross-sections (a dropped-baseline dummy set that is still collinear on a thin
+    date, a singleton group) stay stable. Non-target columns are preserved; a row
+    whose target or regressors are null yields a null residual.
     """
     import polars_ols  # noqa: F401 -- registers the `.least_squares` namespace
 

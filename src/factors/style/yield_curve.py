@@ -15,7 +15,7 @@ split by sub-universe:
 
 Like every style factor each ``compute`` returns a long
 ``[stock_id, date, <shorthand>]`` frame of raw scores; regularization and
-neutralization (against the structural MKT / CTRY / IND loadings) happen
+neutralization (against the structural market / country / industry design) happen
 downstream. These sensitivities are signals, never neutralization regressors.
 """
 
