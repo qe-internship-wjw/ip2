@@ -120,6 +120,23 @@ def design_matrix(exposures, by="date"):
     return exposures, reg_cols
 
 
+def impute_loadings(frame, reg_cols, by):
+    """Cross-sectionally fill missing structural loadings before they are regressed.
+
+    A structural beta is null throughout its rolling-beta warm-up (~2 years). Each
+    null is filled with the per-``by`` median of the regressor's own comparable group.
+    """
+    return frame.with_columns(
+        [
+            pl.when(pl.col(c).is_null())
+            .then(pl.when(pl.col(c) != 0).then(pl.col(c)).median().over(by))
+            .otherwise(pl.col(c))
+            .alias(c)
+            for c in reg_cols
+        ]
+    )
+
+
 def cross_sectional_residuals(frame, target_cols, exposures, by="date"):
     """Replace each ``target_cols`` column with its per-``by`` OLS residual.
 
@@ -130,8 +147,10 @@ def cross_sectional_residuals(frame, target_cols, exposures, by="date"):
     the group *baselines*. A single vectorised ``polars-ols`` expression per target
     evaluated ``.over(by)`` (no per-date loop), with the SVD solver so rank-deficient
     cross-sections (a dropped-baseline dummy set that is still collinear on a thin
-    date, a singleton group) stay stable. Non-target columns are preserved; a row
-    whose target or regressors are null yields a null residual.
+    date, a singleton group) stay stable.
+
+    Non-target columns are preserved; a row whose target -- or a
+    regressor still null after imputation -- is null yields a null residual.
     """
     import polars_ols  # noqa: F401 -- registers the `.least_squares` namespace
 
@@ -140,6 +159,7 @@ def cross_sectional_residuals(frame, target_cols, exposures, by="date"):
     joined = frame.join(
         design.select("stock_id", by, *reg_cols), on=["stock_id", by], how="left"
     )
+    joined = impute_loadings(joined, reg_cols, by)
     resid = [
         pl.col(c)
         .least_squares.ols(

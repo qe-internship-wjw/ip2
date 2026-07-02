@@ -19,6 +19,7 @@ from ._common import (
     SUBUNIVERSES,
     applicable_factor_columns,
     as_df,
+    cross_sectional_residuals,
     factor_columns,
     forward_returns,
     subuniverse_mask,
@@ -155,6 +156,7 @@ def lasso_select(
     fwd_returns,
     neutralized_scores,
     cfg,
+    nonstyle_exposures=None,
     target_col="excess_return",
     universe_col="industry",
 ):
@@ -164,6 +166,13 @@ def lasso_select(
     dense, the regressors are standardized so the L1 penalty is scale-fair, and a
     cross-validated lasso (``LassoCV``) is fit. Factors driven to zero are dropped;
     a factor survives if it survives in *any* sub-universe.
+
+    When ``nonstyle_exposures`` is given, the forward returns are first residualised
+    cross-sectionally against the non-style design (per period), exactly as
+    :func:`single_factor.rank_ic` does: the neutralized (market-orthogonal) style
+    scores are then regressed on a like-for-like target, instead of on raw returns
+    whose ranks and variance are dominated by the un-modelled market risk the scores
+    were neutralized *against*.
 
     Returns the shortlist as a de-duplicated list of factor shorthands.
     """
@@ -176,6 +185,14 @@ def lasso_select(
         )
     period = int(cfg.get("backtest", {}).get("rebalancing_frequency_months", 3))
     fwd = forward_returns(fwd_returns, lags=(1,), target_col=target_col, period_months=period)
+    if nonstyle_exposures is not None:
+        # Sample each security's loadings at its rebalance date, then residualise the
+        # forward return per period (the common cross-section key) -- so the lasso
+        # target is net of non-style risk, matching the neutralized regressors.
+        exposures = fwd.select("stock_id", "date", "period").join(
+            as_df(nonstyle_exposures), on=["stock_id", "date"], how="left"
+        )
+        fwd = cross_sectional_residuals(fwd, ["_fwd1"], exposures, by="period")
     df = scores.join(fwd.rename({"_fwd1": "_y"}), on=["stock_id", "date"], how="inner")
 
     survivors: list[str] = []
