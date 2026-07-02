@@ -93,7 +93,7 @@ def _rolling_ols_betas(periodic, window, min_periods, *, difference):
         pl.col("_date").alias("date"),
         finite("_x1", "level_beta"),
         finite("_x2", "slope_beta"),
-    ).collect()
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -110,7 +110,7 @@ def metric_yield_sensitivity(panel, metric: pl.Expr, cfg):
     The two sides of the regression are aggregated differently on purpose:
 
     Regresses ΔMetric on the change in average (Δlevel, Δslope) over a trailing
-    window of ``sensitivity_window_months / 3`` quarters. Returns an eager
+    window of ``sensitivity_window_months / 3`` quarters. Returns a lazy
     ``[stock_id, date, level_beta, slope_beta]`` frame.
     """
     window, min_periods = _window_periods(cfg, months_per_period=3)
@@ -153,7 +153,7 @@ class _MetricYieldSensitivity(Factor):
         out = metric_yield_sensitivity(panel, self.metric(cfg), cfg).select(
             "stock_id", "date", pl.col(self._beta).alias(self.shorthand)
         )
-        return out.lazy() if isinstance(panel, pl.LazyFrame) else out
+        return out if isinstance(panel, pl.LazyFrame) else out.collect()
 
 
 @register
@@ -212,7 +212,7 @@ class FIYYieldSlopeSensitivity(_MetricYieldSensitivity):
 def return_yield_sensitivity(panel, cfg):
     """MONTHLY rolling level/slope sensitivity of equity (excess) returns.
 
-    Returns an eager ``[stock_id, date, level_beta, slope_beta]`` frame.
+    Returns a lazy ``[stock_id, date, level_beta, slope_beta]`` frame.
     """
     window, min_periods = _window_periods(cfg, months_per_period=1)
     lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
@@ -251,7 +251,7 @@ class _ReturnYieldSensitivity(Factor):
         out = return_yield_sensitivity(panel, cfg).select(
             "stock_id", "date", pl.col(self._beta).alias(self.shorthand)
         )
-        return out.lazy() if isinstance(panel, pl.LazyFrame) else out
+        return out if isinstance(panel, pl.LazyFrame) else out.collect()
 
 
 @register
