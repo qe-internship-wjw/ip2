@@ -201,7 +201,7 @@ def _lasso_survivors(df, cols):
     Xz[:, keep] = (X[:, keep] - mu[keep]) / sd[keep]
 
     coef = _lasso_coefficients(Xz, y - y.mean(), df["period"].to_numpy())
-    return [c for c, b, k in zip(cols, coef, keep) if k and abs(b) > 0.0]
+    return [c for c, b, k in zip(cols, coef, keep) if k and abs(b) > 1e-5]
 
 
 def _lasso_coefficients(X: np.ndarray, y: np.ndarray, periods: np.ndarray) -> np.ndarray:
