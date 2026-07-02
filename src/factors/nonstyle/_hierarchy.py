@@ -83,7 +83,7 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
     ``factor_long`` carries a factor-mimicking portfolio return keyed by
     ``join_on`` (``["date"]`` for the market, ``["date", <member>]`` for
     country/industry). It is aligned to each ``(stock, date)`` and a rolling
-    time-series OLS gives the security's loading, exposed (eagerly) as ``name``.
+    time-series OLS gives the security's loading, exposed lazily as ``name``.
     """
     import polars_ols  # noqa: F401 -- registers the `.least_squares` namespace
 
@@ -108,4 +108,4 @@ def stock_loadings(panel, factor_long, name, cfg, join_on):
     return aligned.select(
         "stock_id", "date",
         pl.when(beta.is_finite()).then(beta).otherwise(None).alias(name),
-    ).collect()
+    )

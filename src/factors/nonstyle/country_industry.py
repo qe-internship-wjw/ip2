@@ -8,15 +8,18 @@ beta on the return of the group it belongs to.
   return (relative to the whole market) or its ``home_country`` return (relative
   to its region).
 * **Industry** -- the security's industry return within the tradeable universe
-  (banks + insurance, per :func:`universe.sector_set`), relative to that set, at
-  ``universe.industry_granularity``.
+  (banks + insurance), relative to that set, at ``universe.industry_granularity``.
+  The ``tradeable`` flag and ``industry`` label are precomputed on the market frame
+  (:func:`src.data.joins.build_market_frame`).
+
+Country/Market returns span the full universe; a loading is attached only to the
+tradeable names (``panel.filter(tradeable)`` in each ``compute``).
 """
 
 from __future__ import annotations
 
 import polars as pl
 
-from ...universe import industry_labels, sector_set
 from ..base import Applicability, Factor, FactorKind, register
 from ._hierarchy import relative_factor, stock_loadings
 
@@ -30,7 +33,12 @@ class Country(Factor):
     applicability = Applicability.ALL_FINANCIALS
 
     def compute(self, panel, cfg):
-        """Per-security rolling beta on its country/region factor return."""
+        """Per-security rolling beta on its country/region factor return.
+
+        The country/region return is cap-weighted over *all* securities in that
+        country/region (:func:`joins.build_market_frame`); loadings are estimated
+        only for the tradeable names.
+        """
         lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
 
         if cfg["universe"]["country_granularity"] == "region":
@@ -39,8 +47,9 @@ class Country(Factor):
             child, parent_keys = "country_code", ("region_code",)
 
         long = relative_factor(lf, child, parent_keys)
-        out = stock_loadings(panel, long, self.shorthand, cfg, ["date", child])
-        return out.lazy() if isinstance(panel, pl.LazyFrame) else out
+        tradeable = lf.filter(pl.col("tradeable"))
+        out = stock_loadings(tradeable, long, self.shorthand, cfg, ["date", child])
+        return out.collect() if isinstance(panel, pl.DataFrame) else out
 
 
 @register
@@ -54,11 +63,14 @@ class Industry(Factor):
     def compute(self, panel, cfg):
         """Per-security rolling beta on its industry factor return.
 
-        The industry return is defined within the tradeable set (relative to that
-        set's return), so the loading is estimated on the tradeable universe.
+        Industry is handled hierarchically: within the tradeable financials set the
+        industry return is taken relative to that set's aggregate, isolating the
+        industry (bank vs insurer) tilt. The ``tradeable`` flag and ``industry``
+        label are precomputed on the market frame (:func:`joins.build_market_frame`),
+        so no re-filtering against the universe is needed here.
         """
         lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
-        tradeable = industry_labels(sector_set(lf, cfg), cfg)
+        tradeable = lf.filter(pl.col("tradeable"))
         long = relative_factor(tradeable, "industry")
         out = stock_loadings(tradeable, long, self.shorthand, cfg, ["date", "industry"])
-        return out.lazy() if isinstance(panel, pl.LazyFrame) else out
+        return out.collect() if isinstance(panel, pl.DataFrame) else out

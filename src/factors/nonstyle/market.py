@@ -32,6 +32,14 @@ class Market(Factor):
     applicability = Applicability.ALL_FINANCIALS
 
     def compute(self, panel, cfg):
-        """Per-security rolling beta on the market return: ``[stock_id, date, MKT]``."""
-        out = stock_loadings(panel, market_returns(panel), self.shorthand, cfg, ["date"])
-        return out.lazy() if isinstance(panel, pl.LazyFrame) else out
+        """Per-security rolling beta on the market return: ``[stock_id, date, MKT]``.
+
+        ``panel`` is the full-universe market frame (:func:`joins.build_market_frame`):
+        the market return is cap-weighted over *every* security, but loadings are
+        estimated only for the tradeable names.
+        """
+        lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
+        factor = market_returns(lf)
+        tradeable = lf.filter(pl.col("tradeable"))
+        out = stock_loadings(tradeable, factor, self.shorthand, cfg, ["date"])
+        return out.collect() if isinstance(panel, pl.DataFrame) else out
