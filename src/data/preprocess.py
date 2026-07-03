@@ -144,6 +144,24 @@ def _require_universe_col(scores, factors, universe_col):
         )
 
 
+def _winsorize_expr(col: str, limits, by: str, mask=None) -> pl.Expr:
+    """Clip ``col`` to its ``[lo, hi]`` cross-sectional quantiles within each ``by`` group.
+
+    When ``mask`` is given the quantile bounds are computed only over masked rows and
+    rows outside the mask are nulled (the sub-universe restriction :func:`winsorize`
+    needs); otherwise the bounds span the whole ``by`` cross-section. ``.over(by)`` so
+    no information crosses the group boundary.
+    """
+    lo, hi = float(limits[0]), float(limits[1])
+    src = pl.col(col).filter(mask) if mask is not None else pl.col(col)
+    clipped = pl.col(col).clip(
+        lower_bound=src.quantile(lo).over(by), upper_bound=src.quantile(hi).over(by)
+    )
+    if mask is None:
+        return clipped.alias(col)
+    return pl.when(mask).then(clipped).otherwise(None).alias(col)
+
+
 def winsorize(scores, limits, by=None, universe_col="industry"):
     """Clip cross-sectional outliers to the given quantile limits.
 
@@ -156,22 +174,23 @@ def winsorize(scores, limits, by=None, universe_col="industry"):
     so no information crosses dates.
     """
     by = by or "date"
-    lo, hi = float(limits[0]), float(limits[1])
     factors = _factor_columns(scores)
     _require_universe_col(scores, factors, universe_col)
+    return scores.with_columns(
+        [_winsorize_expr(c, limits, by, _subuniverse_mask(c, universe_col)) for c in factors]
+    )
 
-    def clip_expr(c: str) -> pl.Expr:
-        mask = _subuniverse_mask(c, universe_col)
-        if mask is None:
-            lob = pl.col(c).quantile(lo).over(by)
-            hib = pl.col(c).quantile(hi).over(by)
-            return pl.col(c).clip(lower_bound=lob, upper_bound=hib).alias(c)
-        lob = pl.col(c).filter(mask).quantile(lo).over(by)
-        hib = pl.col(c).filter(mask).quantile(hi).over(by)
-        clipped = pl.col(c).clip(lower_bound=lob, upper_bound=hib)
-        return pl.when(mask).then(clipped).otherwise(None).alias(c)
 
-    return scores.with_columns([clip_expr(c) for c in factors])
+def winsorize_cross_section(frame, cols, limits, by="date"):
+    """Clip each of ``cols`` to its cross-sectional ``[lo, hi]`` quantiles per ``by`` group.
+
+    A sub-universe-agnostic companion to :func:`winsorize` for **non-factor** series
+    such as forward returns: a return carries no factor/sub-universe label, so its
+    bounds are taken over the whole ``by`` cross-section. Feed it the same
+    ``preprocess.winsorize_limits`` the factor winsorizer uses. Accepts eager or lazy
+    frames and leaves nulls untouched.
+    """
+    return frame.with_columns([_winsorize_expr(c, limits, by, None) for c in cols])
 
 
 def fill_missing(scores, by=None, universe_col="industry"):

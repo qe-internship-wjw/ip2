@@ -6,7 +6,12 @@
      IC measures the part of the return *not explained by non-style factors*.
    - IC decay across forward horizons to inform rebalancing frequency / turnover.
    - Information ratio of the IC series; consistent IR > 0.3 shortlists a factor.
-2. Fama-MacBeth
+2. Quantile return profiling
+   - Cross-sectionally bucket the exposure into quantiles each period, simulate the
+     forward return of each equal-weighted quantile portfolio, and average over
+     periods. The shape of the profile exposes non-linearity that a single Rank IC
+     (a linear rank measure) would hide.
+3. Fama-MacBeth
    - Per-period cross-sectional regressions of forward returns on scores, split by
      sub-universe, aggregated with Newey-West t-stats for autocorrelation.
 
@@ -39,6 +44,7 @@ def rank_ic(
     nonstyle_exposures=None,
     target_col="excess_return",
     period_months=3,
+    winsorize_limits=(0.01, 0.99),
 ):
     """Rank IC series and IC decay across the given forward lags.
 
@@ -59,7 +65,10 @@ def rank_ic(
     """
     scores = as_df(scores)
     fac_cols = factor_columns(scores)
-    fwd = forward_returns(fwd_returns, lags=lags, target_col=target_col, period_months=period_months)
+    fwd = forward_returns(
+        fwd_returns, lags=lags, target_col=target_col,
+        period_months=period_months, winsorize_limits=winsorize_limits,
+    )
 
     if nonstyle_exposures is not None:
         # Sample each security's loadings at its rebalance date, then residualise
@@ -115,6 +124,95 @@ def information_ratio(ic_series):
     return float(s.mean() / std)
 
 
+def quantile_returns(
+    scores,
+    fwd_returns,
+    n_quantiles=10,
+    lag=1,
+    nonstyle_exposures=None,
+    target_col="excess_return",
+    period_months=3,
+    winsorize_limits=(0.01, 0.99),
+    weight_col=None,
+):
+    """Forward-return profile of quantile portfolios, one per factor.
+
+    Buckets are formed per period as in :func:`rank_ic`; daily returns are winsorized
+    before compounding (``winsorize_limits``, see :func:`forward_returns`) so no extreme
+    print drives a bucket's weighted mean.
+
+    Each bucket's portfolio return is **equal-weighted** by default. Pass
+    ``weight_col`` (e.g. ``"mcap_usd"``) to cap-weight instead: the column is sampled
+    at the formation date (:func:`forward_returns`) and each bucket return becomes
+    ``sum(w * ret) / sum(w)`` over its members. ``weight_col`` must be present in the
+    ``fwd_returns`` frame (e.g. ``sector_panel.select("stock_id", "date",
+    "excess_return", "mcap_usd")``); a bucket whose weights sum to zero yields null.
+
+    Returns a long frame ``[factor, quantile, mean_ret, std_ret, n_periods]`` where
+    ``quantile`` runs ``1`` (lowest exposure) .. ``n_quantiles`` (highest) and
+    ``mean_ret`` is the average per-period return of that quantile portfolio.
+    """
+    scores = as_df(scores)
+    fac_cols = factor_columns(scores)
+    fwd = forward_returns(
+        fwd_returns, lags=(lag,), target_col=target_col,
+        period_months=period_months, winsorize_limits=winsorize_limits,
+        weight_col=weight_col,
+    )
+    fwd_col = f"_fwd{lag}"
+
+    if nonstyle_exposures is not None:
+        # Sample each security's loadings at its rebalance date, then residualise
+        # the forward returns per period (the common cross-section key). The weight
+        # column is a non-target passthrough, so it survives the residualization.
+        exposures = fwd.select("stock_id", "date", "period").join(
+            as_df(nonstyle_exposures), on=["stock_id", "date"], how="left"
+        )
+        fwd = cross_sectional_residuals(fwd, [fwd_col], exposures, by="period")
+
+    df = scores.join(fwd, on=["stock_id", "date"], how="inner")
+
+    # rank in [1, N] over the period -> integer bucket in [1, n_quantiles].
+    bucket = ((pl.col("_rank") - 1) * n_quantiles) // pl.len().over("period") + 1
+
+    # Per (period, bucket) portfolio return: equal- or (mcap-)weighted mean.
+    if weight_col is not None:
+        wsum = pl.col(weight_col).sum()
+        port_ret = (
+            pl.when(wsum > 0)
+            .then((pl.col(fwd_col) * pl.col(weight_col)).sum() / wsum)
+            .otherwise(None)
+        )
+    else:
+        port_ret = pl.col(fwd_col).mean()
+
+    frames = []
+    for f in fac_cols:
+        drop_cols = [f, fwd_col] + ([weight_col] if weight_col is not None else [])
+        valid = df.drop_nulls(drop_cols).with_columns(
+            _rank=pl.col(f).rank(method="ordinal").over("period").cast(pl.Int64)
+        )
+        frames.append(
+            valid.with_columns(quantile=bucket)
+            # weight the members within each period, then average across periods.
+            .group_by("period", "quantile")
+            .agg(port_ret=port_ret)
+            .group_by("quantile")
+            .agg(
+                mean_ret=pl.col("port_ret").mean(),
+                std_ret=pl.col("port_ret").std(),
+                n_periods=pl.len(),
+            )
+            .with_columns(factor=pl.lit(f))
+        )
+
+    return (
+        pl.concat(frames)
+        .select("factor", "quantile", "mean_ret", "std_ret", "n_periods")
+        .sort("factor", "quantile")
+    )
+
+
 def _hac_lags(n: int, override) -> int:
     """Newey-West maxlags: caller override, else the ``4 (T/100)^(2/9)`` rule."""
     lags = override if override is not None else max(1, int(4 * (n / 100) ** (2 / 9)))
@@ -133,6 +231,7 @@ def fama_macbeth(
     target_col="excess_return",
     period_months=3,
     universe_col="industry",
+    winsorize_limits=(0.01, 0.99),
 ):
     """Aggregate cross-sectional regression premia with Newey-West t-stats.
 
@@ -151,7 +250,10 @@ def fama_macbeth(
             "Banks vs Insurers; otherwise the mutually-exclusive sector factors "
             "drop every row. Attach it via universe.industry_labels."
         )
-    fwd = forward_returns(fwd_returns, lags=(1,), target_col=target_col, period_months=period_months)
+    fwd = forward_returns(
+        fwd_returns, lags=(1,), target_col=target_col,
+        period_months=period_months, winsorize_limits=winsorize_limits,
+    )
     df = scores.join(fwd.rename({"_fwd1": "_y"}), on=["stock_id", "date"], how="inner")
 
     frames = []

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import polars as pl
 
+from ..data.preprocess import winsorize_cross_section
 from ..factors.base import Applicability, registry
 
 ID_COLS = ("stock_id", "date")
@@ -64,30 +65,53 @@ def subuniverse_mask(sub: str, universe_col: str = "industry") -> pl.Expr:
     return pl.col(universe_col).str.starts_with(sub)
 
 
-def forward_returns(fwd_returns, lags=(1,), target_col="excess_return", period_months=3):
+def forward_returns(
+    fwd_returns, lags=(1,), target_col="excess_return", period_months=3,
+    winsorize_limits=(0.01, 0.99), weight_col=None,
+):
     """Compounded forward returns at each rebalancing-period horizon in ``lags``.
 
-    The daily panel is downsampled to non-overlapping calendar buckets of
+    The daily target is first **winsorized cross-sectionally per date** (to the
+    ``winsorize_limits`` quantiles -- ``preprocess.winsorize_limits`` by default; pass
+    ``None`` to skip): a single extreme daily print would otherwise compound into a
+    period return that dominates the mean of a quantile portfolio or a Fama-MacBeth
+    cross-section. Returns are not sub-universe-specific, so the bounds span the whole
+    per-date cross-section (:func:`src.data.preprocess.winsorize_cross_section`).
+
+    The daily panel is then downsampled to non-overlapping calendar buckets of
     ``period_months`` (the rebalancing frequency; quarterly by default), the
     per-period excess return is compounded within each ``(security, period)``
     bucket, and each bucket is stamped with its last trading date. ``_fwd{lag}``
     then holds the compounded return realised ``lag`` *periods* ahead
     (``shift(-lag)`` within each security).
 
-    Returns ``[stock_id, date, period, _fwd{lag}...]``: ``date`` is the security's
-    period-end trading day (join it to a daily ``scores`` frame to keep exactly the
-    rebalancing rows) and ``period`` is the common calendar bucket -- group
-    cross-sections on ``period``, since securities' period-end days differ under
+    ``weight_col`` (e.g. ``"mcap_usd"``) surfaces a point-in-time weighting column
+    to the validators. It is sampled at the **period-end** trading day (``.last()``,
+    the formation date) and passed straight through untouched -- it is never
+    winsorized or compounded -- so a downstream cap-weighted quantile portfolio
+    weights each name by its market cap *at rebalance*. It must be present in
+    ``fwd_returns``; ``None`` (default) carries no weight.
+
+    Returns ``[stock_id, date, period, (weight_col,) _fwd{lag}...]``: ``date`` is the
+    security's period-end trading day (join it to a daily ``scores`` frame to keep
+    exactly the rebalancing rows) and ``period`` is the common calendar bucket --
+    group cross-sections on ``period``, since securities' period-end days differ under
     staggered trading calendars.
     """
     df = as_df(fwd_returns).sort("stock_id", "date")
+    if winsorize_limits is not None:
+        df = winsorize_cross_section(df, [target_col], winsorize_limits, by="date")
+    weight = [weight_col] if weight_col is not None else []
     periodic = (
-        df.select("stock_id", "date", target_col)
+        df.select("stock_id", "date", target_col, *weight)
         .with_columns(_period=pl.col("date").dt.truncate(f"{period_months}mo"))
         .group_by("stock_id", "_period")
         .agg(
-            _date=pl.col("date").last(),
-            _ret=(pl.col(target_col) + 1.0).product() - 1.0,
+            pl.col("date").last().alias("_date"),
+            ((pl.col(target_col) + 1.0).product() - 1.0).alias("_ret"),
+            # Weight is a level at the formation date, not a return: take the
+            # period-end value as-is (no compounding).
+            *[pl.col(w).last() for w in weight],
         )
         .sort("stock_id", "_period")
     )
@@ -99,6 +123,7 @@ def forward_returns(fwd_returns, lags=(1,), target_col="excess_return", period_m
         "stock_id",
         pl.col("_date").alias("date"),
         pl.col("_period").alias("period"),
+        *[pl.col(w) for w in weight],
         *fwd,
     )
 
