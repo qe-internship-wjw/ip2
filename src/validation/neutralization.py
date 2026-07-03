@@ -9,11 +9,11 @@ a beta's warm-up null does not drop a newly listed stock's valid score.
 
 from __future__ import annotations
 
-from ..data.preprocess import standardize
+from ..data.preprocess import regularize
 from ._common import as_df, cross_sectional_residuals, factor_columns
 
 
-def neutralize(raw_scores, nonstyle_exposures, by="date", universe_col="industry"):
+def neutralize(raw_scores, nonstyle_exposures, cfg, by="date", universe_col="industry"):
     """Re-standardized residuals of a per-``by`` cross-sectional OLS of each style
     score on the non-style exposures.
 
@@ -46,5 +46,5 @@ def neutralize(raw_scores, nonstyle_exposures, by="date", universe_col="industry
     style_cols = factor_columns(scores)
     residuals = cross_sectional_residuals(scores, style_cols, nonstyle_exposures, by=by)
     # Re-standardize (within each factor's sub-universe) to restore unit cross-sectional variance.
-    residuals = standardize(residuals, by=by, universe_col=universe_col)
+    residuals = regularize(residuals, cfg)
     return residuals.sort("stock_id", by)
