@@ -97,6 +97,51 @@ def fit_nelson_siegel(zero_curve, cfg):
     ).sort("date", "currency")
 
 
+def fit_simple_level_slope(zero_curve, cfg=None):
+    """Estimate level/slope per date per sovereign curve from two raw tenors.
+
+    A deliberately simplistic, model-free counterpart to
+    :func:`fit_nelson_siegel`, for robustness checks: ``level`` is the 120M
+    (10-year) zero rate and ``slope`` is the 24M rate minus the 120M rate. No
+    curvature is produced -- it is unused elsewhere in the project.
+
+    Parameters
+    ----------
+    zero_curve : pl.LazyFrame | pl.DataFrame
+        Zero-curve table with ``date``, ``currency``, ``tenor_description`` and
+        ``zero_rate`` columns.
+    cfg : Config, optional
+        Ignored; accepted only to mirror :func:`fit_nelson_siegel`'s signature
+        so the two methods are drop-in interchangeable.
+
+    Returns
+    -------
+    pl.DataFrame
+        One row per ``date`` x ``currency`` with ``level`` and ``slope``, sorted
+        by date then currency. Rows missing either tenor are dropped.
+    """
+    lf = zero_curve.lazy() if isinstance(zero_curve, pl.DataFrame) else zero_curve
+
+    return (
+        lf.filter(pl.col("tenor_description").is_in(["24M", "120M"]))
+        .group_by("date", "currency")
+        .agg(
+            r24=pl.col("zero_rate")
+            .filter(pl.col("tenor_description") == "24M")
+            .first(),
+            level=pl.col("zero_rate")
+            .filter(pl.col("tenor_description") == "120M")
+            .first(),
+        )
+        .with_columns(slope=pl.col("r24") - pl.col("level"))
+        .select("date", "currency", "level", "slope")
+        .drop_nulls(["level", "slope"])
+        .collect()
+        .with_columns(pl.col("currency").cast(pl.Categorical))
+        .sort("date", "currency")
+    )
+
+
 # ── Panel enrichment (build-time, so the factors stay IO-free) ────────────────
 
 
@@ -108,6 +153,25 @@ def attach_nelson_siegel(panel, ns_params):
 
     out = lf.join(
         nsp.select("date", "currency", "level", "slope", "curvature"),
+        left_on=["date", "currency_code"],
+        right_on=["date", "currency"],
+        how="left",
+    )
+    return out.collect() if isinstance(panel, pl.DataFrame) else out
+
+
+def attach_simple_level_slope(panel, simple_params):
+    """Left-join the simple ``level``/``slope`` onto the panel.
+
+    Curvature-free counterpart to :func:`attach_nelson_siegel`; uses the same
+    ``level``/``slope`` column names so it is a drop-in replacement when
+    robustness-checking the wider pipeline against the Nelson-Siegel enrichment.
+    """
+    lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
+    sp = simple_params.lazy() if isinstance(simple_params, pl.DataFrame) else simple_params
+
+    out = lf.join(
+        sp.select("date", "currency", "level", "slope"),
         left_on=["date", "currency_code"],
         right_on=["date", "currency"],
         how="left",
