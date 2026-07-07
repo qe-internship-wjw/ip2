@@ -159,6 +159,8 @@ def lasso_select(
     nonstyle_exposures=None,
     target_col="excess_return",
     universe_col="industry",
+    *,
+    delist_events,
 ):
     """Lasso predictive regression per sub-universe; return the surviving factors.
 
@@ -174,6 +176,9 @@ def lasso_select(
     whose ranks and variance are dominated by the un-modelled market risk the scores
     were neutralized *against*.
 
+    ``delist_events`` (required keyword) is passed to :func:`forward_returns` so
+    terminal delisting returns enter the lasso target (``None`` opts out).
+
     Returns the shortlist as a de-duplicated list of factor shorthands.
     """
     scores = as_df(neutralized_scores)
@@ -184,7 +189,10 @@ def lasso_select(
             "dense rows. Attach it via universe.industry_labels."
         )
     period = int(cfg.get("backtest", {}).get("rebalancing_frequency_months", 3))
-    fwd = forward_returns(fwd_returns, lags=(1,), target_col=target_col, period_months=period)
+    fwd = forward_returns(
+        fwd_returns, lags=(1,), target_col=target_col, period_months=period,
+        delist_events=delist_events,
+    )
     if nonstyle_exposures is not None:
         # Sample each security's loadings at its rebalance date, then residualise the
         # forward return per period (the common cross-section key) -- so the lasso

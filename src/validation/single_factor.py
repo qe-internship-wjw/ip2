@@ -45,6 +45,8 @@ def rank_ic(
     target_col="excess_return",
     period_months=3,
     winsorize_limits=(0.01, 0.99),
+    *,
+    delist_events,
 ):
     """Rank IC series and IC decay across the given forward lags.
 
@@ -60,6 +62,9 @@ def rank_ic(
     below). Cross-sections are grouped on the common ``period`` key (securities'
     period-end days differ under staggered trading calendars).
 
+    ``delist_events`` (required keyword) is passed to :func:`forward_returns` so
+    terminal delisting returns enter the target (``None`` opts out — see there).
+
     Returns a long frame ``[period, factor, lag, ic]`` -- the IC time series whose
     behaviour across lags is the IC-decay curve.
     """
@@ -68,6 +73,7 @@ def rank_ic(
     fwd = forward_returns(
         fwd_returns, lags=lags, target_col=target_col,
         period_months=period_months, winsorize_limits=winsorize_limits,
+        delist_events=delist_events,
     )
 
     if nonstyle_exposures is not None:
@@ -134,6 +140,8 @@ def quantile_returns(
     period_months=3,
     winsorize_limits=(0.01, 0.99),
     weight_col=None,
+    *,
+    delist_events,
 ):
     """Forward-return profile of quantile portfolios, one per factor.
 
@@ -148,6 +156,9 @@ def quantile_returns(
     ``fwd_returns`` frame (e.g. ``sector_panel.select("stock_id", "date",
     "excess_return", "mcap_usd")``); a bucket whose weights sum to zero yields null.
 
+    ``delist_events`` (required keyword) is passed to :func:`forward_returns` so
+    terminal delisting returns enter the bucket returns (``None`` opts out).
+
     Returns a long frame ``[factor, quantile, mean_ret, std_ret, n_periods]`` where
     ``quantile`` runs ``1`` (lowest exposure) .. ``n_quantiles`` (highest) and
     ``mean_ret`` is the average per-period return of that quantile portfolio.
@@ -157,7 +168,7 @@ def quantile_returns(
     fwd = forward_returns(
         fwd_returns, lags=(lag,), target_col=target_col,
         period_months=period_months, winsorize_limits=winsorize_limits,
-        weight_col=weight_col,
+        weight_col=weight_col, delist_events=delist_events,
     )
     fwd_col = f"_fwd{lag}"
 
@@ -232,12 +243,17 @@ def fama_macbeth(
     period_months=3,
     universe_col="industry",
     winsorize_limits=(0.01, 0.99),
+    *,
+    delist_events,
 ):
     """Aggregate cross-sectional regression premia with Newey-West t-stats.
 
     Regression is run **per sub-universe**: Within a sub-universe the design is dense,
     so the usual multivariate Fama-MacBeth applies (a per-period cross-sectional
     OLS, then a Newey-West time-series aggregation of the coefficient series).
+
+    ``delist_events`` (required keyword) is passed to :func:`forward_returns` so
+    terminal delisting returns enter the regression target (``None`` opts out).
 
     Returns a frame ``[sub_universe, factor, mean_coef, t_stat, nw_se,
     n_periods]`` (``factor`` includes ``const``); all-financials factors appear
@@ -253,6 +269,7 @@ def fama_macbeth(
     fwd = forward_returns(
         fwd_returns, lags=(1,), target_col=target_col,
         period_months=period_months, winsorize_limits=winsorize_limits,
+        delist_events=delist_events,
     )
     df = scores.join(fwd.rename({"_fwd1": "_y"}), on=["stock_id", "date"], how="inner")
 

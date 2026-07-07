@@ -67,7 +67,7 @@ def subuniverse_mask(sub: str, universe_col: str = "industry") -> pl.Expr:
 
 def forward_returns(
     fwd_returns, lags=(1,), target_col="excess_return", period_months=3,
-    winsorize_limits=(0.01, 0.99), weight_col=None,
+    winsorize_limits=(0.01, 0.99), weight_col=None, *, delist_events,
 ):
     """Compounded forward returns at each rebalancing-period horizon in ``lags``.
 
@@ -92,6 +92,17 @@ def forward_returns(
     weights each name by its market cap *at rebalance*. It must be present in
     ``fwd_returns``; ``None`` (default) carries no weight.
 
+    ``delist_events`` (**required keyword**) threads the survivorship fix
+    (DELISTING_HANDLING.md): rows after a security's ``delist_date`` are dropped, so
+    no phantom post-delist period ever forms, and the reason-dependent terminal
+    return is compounded into the period spanning the delist -- *after*
+    winsorization, so a wipeout's -100% settlement is never clipped away as an
+    outlier. Pass the frame from :func:`src.data.delisting.delist_events`
+    (needs ``stock_id, delist_date, delist_return``), built on the same price
+    window; events for securities absent from ``fwd_returns`` are inert. Pass
+    ``None`` to opt out explicitly (legacy, survivorship-biased behaviour: a
+    wiped-out name silently escapes its terminal loss).
+
     Returns ``[stock_id, date, period, (weight_col,) _fwd{lag}...]``: ``date`` is the
     security's period-end trading day (join it to a daily ``scores`` frame to keep
     exactly the rebalancing rows) and ``period`` is the common calendar bucket --
@@ -99,6 +110,24 @@ def forward_returns(
     staggered trading calendars.
     """
     df = as_df(fwd_returns).sort("stock_id", "date")
+
+    events = None
+    if delist_events is not None:
+        events = as_df(delist_events).select("stock_id", "delist_date", "delist_return")
+        if events.schema["stock_id"] != df.schema["stock_id"]:
+            events = events.with_columns(pl.col("stock_id").cast(df.schema["stock_id"]))
+        # A security ceases to exist after its delist date: drop the zombie tail so
+        # post-delist periods never form (they would otherwise enter cross-sections
+        # as phantom 0-return observations).
+        df = (
+            df.join(events.select("stock_id", "delist_date"), on="stock_id", how="left")
+            .filter(
+                pl.col("delist_date").is_null()
+                | (pl.col("date") <= pl.col("delist_date"))
+            )
+            .drop("delist_date")
+        )
+
     if winsorize_limits is not None:
         df = winsorize_cross_section(df, [target_col], winsorize_limits, by="date")
     weight = [weight_col] if weight_col is not None else []
@@ -115,6 +144,30 @@ def forward_returns(
         )
         .sort("stock_id", "_period")
     )
+    if events is not None:
+        # Book the terminal settlement in the period spanning the delist -- after
+        # winsorization (a -100% print must not be clipped as an outlier) and before
+        # the forward shift. A null compounded return in the delist period (no usable
+        # prints) settles from the last mark: treat it as 0, then apply the terminal.
+        settled = (1.0 + pl.col("_ret").fill_null(0.0)) * (
+            1.0 + pl.col("delist_return")
+        ) - 1.0
+        periodic = (
+            periodic.join(
+                events.with_columns(
+                    _period=pl.col("delist_date").dt.truncate(f"{period_months}mo")
+                ).select("stock_id", "_period", "delist_return"),
+                on=["stock_id", "_period"],
+                how="left",
+            )
+            .with_columns(
+                _ret=pl.when(pl.col("delist_return").is_not_null())
+                .then(settled)
+                .otherwise(pl.col("_ret"))
+            )
+            .drop("delist_return")
+            .sort("stock_id", "_period")
+        )
     fwd = [
         pl.col("_ret").shift(-lag).over("stock_id").alias(f"_fwd{lag}")
         for lag in lags
