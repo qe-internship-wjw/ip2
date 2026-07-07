@@ -15,6 +15,12 @@ of the pipeline needs to treat factors polymorphically:
                        design, and a stacked beta is exactly collinear with its
                        expanded ``beta_{g}`` block, so residualising would
                        annihilate the signal. Regularization still applies.
+* ``input_frame``   -- which panel ``compute`` reads: ``"sector_panel"`` (the
+                       tradeable-only rich panel; default) or ``"market_frame"``
+                       (the full-universe light frame the factor-mimicking
+                       portfolios need -- the structural loadings and beta
+                       signals). Drivers (scripts/notebooks) route by this
+                       instead of sniffing module names.
 
 Concrete factors implement `compute()` to return raw cross-sectional scores;
 neutralization and standardization happen downstream so factors stay declarative.
@@ -50,6 +56,7 @@ class Factor:
     kind: FactorKind = FactorKind.SYSTEMATIC
     applicability: Applicability = Applicability.ALL_FINANCIALS
     neutralize: bool = True
+    input_frame: str = "sector_panel"
 
     def compute(self, panel, cfg):
         """Return raw (pre-neutralization) cross-sectional factor scores."""

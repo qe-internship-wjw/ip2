@@ -30,6 +30,7 @@ class Market(Factor):
     sleeve = "NonStyle"
     kind = FactorKind.SYSTEMATIC
     applicability = Applicability.ALL_FINANCIALS
+    input_frame = "market_frame"
 
     def compute(self, panel, cfg):
         """Per-security rolling beta on the market return: ``[stock_id, date, MKT]``.

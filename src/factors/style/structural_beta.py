@@ -77,6 +77,7 @@ class _StructuralBeta(Factor):
     kind = FactorKind.SYSTEMATIC
     applicability = Applicability.ALL_FINANCIALS
     neutralize = False
+    input_frame = "market_frame"
 
     def _stacked(self, lf, cfg):
         raise NotImplementedError

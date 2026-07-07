@@ -31,6 +31,7 @@ class Country(Factor):
     sleeve = "NonStyle"
     kind = FactorKind.SYSTEMATIC
     applicability = Applicability.ALL_FINANCIALS
+    input_frame = "market_frame"
 
     def compute(self, panel, cfg):
         """Per-country/region betas + region dummies, one column block per group.
@@ -61,6 +62,7 @@ class Industry(Factor):
     sleeve = "NonStyle"
     kind = FactorKind.SYSTEMATIC
     applicability = Applicability.ALL_FINANCIALS
+    input_frame = "market_frame"
 
     def compute(self, panel, cfg):
         """Per-industry betas + industry dummies, one column block per group.
