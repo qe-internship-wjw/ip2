@@ -80,18 +80,6 @@ class NPLRatio(RatioFactor):
 
 
 @register
-class CoreDepositRatio(RatioFactor):
-    name = "Core Deposit Ratio"
-    shorthand = "CDR"
-    sleeve = "Quality"
-    kind = FactorKind.SYSTEMATIC
-    applicability = Applicability.BANKS
-
-    def expr(self, cfg) -> pl.Expr:
-        return pl.col("customer_deposits") / pl.col("deposits")
-
-
-@register
 class PretaxExpenseToAssets(RatioFactor):
     name = "Total Pretax Expense to Average Assets"
     shorthand = "PTX/AA"
