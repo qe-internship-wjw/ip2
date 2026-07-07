@@ -40,26 +40,56 @@ factors:
 # --- Validation ---------------------------------------------------------------
 validation:
   ic:
-    method: rank                        
+    method: rank
     decay_lags: [1, 2, 3, 4]            # IC decay horizons
-    ir_shortlist_threshold: 0.3         
-  quantiles: 10                         
+    ir_shortlist_threshold: 0.2         # single-factor IR gate (|IR| at lag 1)
+  fama_macbeth:
+    t_stat_threshold: 1.0               # single-factor FM gate (|Newey-West t|)
+  quantiles: 10
   redundancy:
-    correlation_threshold: 0.6          # flag factor pairs with rho > 0.6
-    cluster_representative: best_ir      # best_ir | composite (equal-weight z)
+    correlation_threshold: 0.4          # flag factor pairs with |rho| > threshold
+    cluster_representative: fm_gradient  # fm_gradient (largest |FM coef|) | best_ir | composite
     lasso: true                         # parsimony via lasso/elastic-net
+  selection:
+    min_shortlist_warn: 10              # soft floor: warn (never enforce) below this size
 
 # --- Portfolio construction ---------------------------------------------------
 portfolio:
   strategic_allocation: equal           # equal (1/K) | ir_weighted
   risk_aversion: 2.0
+  expected_returns:
+    estimation: walk_forward            # walk_forward | full_sample (leaky; debug only)
+    min_estimation_periods: 8           # quarters of premia/IC history before first use
+    james_stein: true                   # shrink premia/IC means toward their grand mean
+  constraints:
+    gross_leverage: 2.0                 # sum |w| <= L  (100/100 long-short)
+    net_exposure: [-0.2, 0.2]           # B_L <= sum w <= B_U
+    max_name_weight: 0.02               # per-name cap (realized P&L is unwinsorized)
+  risk_model:
+    frequency_months: 1                 # monthly factor-return cross-sections
+    factor_cov_window_months: 60        # trailing window for the K x K factor cov
+    idio_window_months: 36              # trailing window for idio residual variances
+    idio_min_obs: 12                    # min monthly residuals; below -> median impute
   covariance:
     shrinkage: linear                   # linear (simple Ledoit-Wolf) | nonlinear
-    target: baseline                    # baseline | factor_model
+    target: diagonal                    # diagonal of sample factor variances (MVO_PARAMETER_ESTIMATION.md)
     ema_coefficient: 0.94               # slow-moving risk model
+  optimizer:
+    solver: null                        # auto: first usable of OSQP/SCS/HIGHS (CLARABEL blocked by app-control policy)
 
 # --- Backtest / evaluation ----------------------------------------------------
 backtest:
   rebalancing_frequency_months: 3       # quarterly
+  schedule:                             # dynamic-selection walk-forward (DYNAMIC_SELECTION_PLAN.md)
+    train_start: 2000-01-01             # first period entering selection / premia windows
+    trade_start: 2006-01-01             # first P&L period (first formation = one quarter earlier)
+    end: 2025-12-31                     # last P&L period
+    reselection_frequency_months: 24    # re-run feature selection every 2 years
   hedge_broad_market_beta: true         # broad-index beta assumed hedged
   metrics: [excess_return, max_drawdown, sharpe, information_ratio]
+  delisting_return: -1.0                # terminal return booked for wipeouts
+  delisting:                            # price-path classifier (DELISTING_HANDLING.md)
+    drawdown_threshold: 0.30            # exit_price <= threshold * trailing peak => wipeout
+    peak_window_days: 252               # trailing *active* rows defining the peak
+    floor_price: 1.0e-5                 # auxiliary floor-sentinel test
+    censor_buffer_days: 15              # active within this of panel end => alive
