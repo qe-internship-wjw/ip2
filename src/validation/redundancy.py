@@ -1,11 +1,13 @@
 """Reducing redundancy.
 
 1. Correlated factors  - time-series average of cross-sectional correlations;
-                         flag pairs with rho > 0.6.
+                         flag pairs with |rho| above the configured threshold.
 2. Clustering          - group correlated factors; represent each cluster by its
-                         highest IC-IR factor or an equal-weighted z-score composite.
-3. Parsimony           - lasso on a predictive regression of forward returns on all
-                         neutralized factors; survivors are shortlisted.
+                         largest-|Fama-MacBeth-coefficient| member (``fm_gradient``),
+                         its highest IC-IR member (``best_ir``), or an
+                         equal-weighted z-score composite.
+3. Parsimony           - lasso on a predictive regression of forward returns on the
+                         supplied neutralized factors; survivors are shortlisted.
 """
 
 from __future__ import annotations
@@ -99,9 +101,19 @@ def cluster_factors(corr, threshold=0.6):
     return [sorted(members) for members in groups.values()]
 
 
-def select_cluster_representatives(clusters, ic_ir=None, scores=None, method="best_ir"):
+def select_cluster_representatives(
+    clusters, ic_ir=None, scores=None, method="best_ir", fm=None
+):
     """Represent each cluster by one factor or an equal-weighted z-score composite.
 
+    * ``method="fm_gradient"`` -- keep the factor with the largest absolute
+      Fama-MacBeth gradient (|mean coefficient|, the per-unit-z premium) per
+      cluster. ``fm`` maps factor -> |coef| (a dict, or the frame from
+      :func:`single_factor.fama_macbeth`; with ``pooled=True`` each factor has
+      exactly one row, otherwise the max |coef| across sub-universes is used).
+      A member without a finite coefficient falls back to its |IC-IR| from
+      ``ic_ir``; members with a coefficient always outrank members without one.
+      Returns the list of representative factor names.
     * ``method="best_ir"`` -- keep the highest IC-IR factor per cluster. ``ic_ir``
       maps factor -> IR (a dict, or the frame from
       :func:`single_factor.information_ratio`). Returns the list of representative
@@ -112,6 +124,19 @@ def select_cluster_representatives(clusters, ic_ir=None, scores=None, method="be
       frame (a singleton cluster keeps its own name; otherwise members are joined
       with ``+``).
     """
+    if method == "fm_gradient":
+        grad = _fm_gradient_lookup(fm)
+        ir = _ir_lookup(ic_ir)
+
+        def gradient_key(f):
+            g = grad.get(f)
+            if g is not None and np.isfinite(g):
+                return (1, abs(g))
+            v = ir.get(f)
+            return (0, abs(v) if v is not None and np.isfinite(v) else float("-inf"))
+
+        return [max(cluster, key=gradient_key) for cluster in clusters]
+
     if method == "composite":
         if scores is None:
             raise ValueError("method='composite' requires the `scores` frame.")
@@ -150,6 +175,24 @@ def _ir_lookup(ic_ir) -> dict:
         best = ic_ir.group_by("factor").agg(pl.col("ir").max())
         return dict(zip(best["factor"].to_list(), best["ir"].to_list()))
     raise TypeError("ic_ir must be a dict or a polars DataFrame.")
+
+
+def _fm_gradient_lookup(fm) -> dict:
+    """Normalise an FM source (dict or fama_macbeth frame) to factor -> |coef|."""
+    if fm is None:
+        return {}
+    if isinstance(fm, dict):
+        return fm
+    if isinstance(fm, pl.DataFrame):
+        best = (
+            fm.filter(pl.col("factor") != "const")
+            .drop_nulls("mean_coef")
+            .filter(pl.col("mean_coef").is_finite())
+            .group_by("factor")
+            .agg(pl.col("mean_coef").abs().max().alias("grad"))
+        )
+        return dict(zip(best["factor"].to_list(), best["grad"].to_list()))
+    raise TypeError("fm must be a dict or a polars DataFrame.")
 
 
 def lasso_select(

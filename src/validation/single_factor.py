@@ -26,6 +26,7 @@ import polars as pl
 import polars_ols  # noqa: F401 -- registers the `.least_squares` expr namespace
 import statsmodels.api as sm
 
+from ..factors.base import Applicability
 from ._common import (
     SUBUNIVERSES,
     applicable_factor_columns,
@@ -243,21 +244,32 @@ def fama_macbeth(
     period_months=3,
     universe_col="industry",
     winsorize_limits=(0.01, 0.99),
+    pooled=False,
     *,
     delist_events,
 ):
     """Aggregate cross-sectional regression premia with Newey-West t-stats.
 
-    Regression is run **per sub-universe**: Within a sub-universe the design is dense,
-    so the usual multivariate Fama-MacBeth applies (a per-period cross-sectional
-    OLS, then a Newey-West time-series aggregation of the coefficient series).
+    Two regression architectures (per-period cross-sectional OLS, then a
+    Newey-West time-series aggregation of the coefficient series):
+
+    * ``pooled=False`` (legacy) -- one regression **per sub-universe** (bank /
+      insurance rows), each on its dense applicable design. All-financials
+      factors appear once *per sub-universe* (two estimates each).
+    * ``pooled=True`` -- each factor is **tested exactly once, on the universe
+      it is applicable to**: all-financials factors on the pooled cross-section
+      (``sub_universe="all"``), sector factors on their own sub-universe. The
+      pooled run keeps the sector factors as controls by zero-filling them
+      off-sector (they are z-scored *within* their sub-universe, so both the
+      zero-fill and the single pooled intercept are unbiased); the sector runs
+      keep the all-financials factors as controls, exactly as before -- only
+      the *reported* rows change.
 
     ``delist_events`` (required keyword) is passed to :func:`forward_returns` so
     terminal delisting returns enter the regression target (``None`` opts out).
 
     Returns a frame ``[sub_universe, factor, mean_coef, t_stat, nw_se,
-    n_periods]`` (``factor`` includes ``const``); all-financials factors appear
-    once per sub-universe.
+    n_periods]`` (``factor`` includes ``const``, reported once per regression).
     """
     scores = as_df(scores)
     if universe_col not in scores.columns:
@@ -274,13 +286,59 @@ def fama_macbeth(
     df = scores.join(fwd.rename({"_fwd1": "_y"}), on=["stock_id", "date"], how="inner")
 
     frames = []
-    for sub, applic in SUBUNIVERSES.items():
-        fac_cols = applicable_factor_columns(scores, applic)
-        # Within a sub-universe the applicable factors form a dense design; drop
-        # only rows still carrying a null (e.g. a loading's warm-up window).
-        sub_df = df.filter(subuniverse_mask(sub, universe_col)).drop_nulls(["_y", *fac_cols])
-        premia = _fama_macbeth_premia(sub_df, fac_cols, newey_west_lags)
-        frames.append(premia.with_columns(sub_universe=pl.lit(sub)))
+    if pooled:
+        all_fin = applicable_factor_columns(scores, (Applicability.ALL_FINANCIALS,))
+        sector = {
+            "bank": applicable_factor_columns(scores, (Applicability.BANKS,)),
+            "insurance": applicable_factor_columns(scores, (Applicability.INSURANCE,)),
+        }
+        if all_fin:
+            # Pooled run over every financial row. Sector factors stay in the
+            # design as within-sector controls: zero off their sub-universe
+            # (in-sector nulls stay null, so the dense-design drop below still
+            # applies), reported nowhere -- only the all-financials rows are.
+            zero_off_sector = [
+                pl.when(subuniverse_mask(sub, universe_col))
+                .then(pl.col(c))
+                .otherwise(0.0)
+                .alias(c)
+                for sub, cols in sector.items()
+                for c in cols
+            ]
+            fac_cols = all_fin + [c for cols in sector.values() for c in cols]
+            pooled_df = (
+                df.filter(
+                    subuniverse_mask("bank", universe_col)
+                    | subuniverse_mask("insurance", universe_col)
+                )
+                .with_columns(zero_off_sector)
+                .drop_nulls(["_y", *fac_cols])
+            )
+            premia = _fama_macbeth_premia(pooled_df, fac_cols, newey_west_lags)
+            frames.append(
+                premia.filter(pl.col("factor").is_in(["const", *all_fin]))
+                .with_columns(sub_universe=pl.lit("all"))
+            )
+        for sub, applic in SUBUNIVERSES.items():
+            if not sector[sub]:
+                continue
+            fac_cols = applicable_factor_columns(scores, applic)
+            sub_df = df.filter(subuniverse_mask(sub, universe_col)).drop_nulls(["_y", *fac_cols])
+            premia = _fama_macbeth_premia(sub_df, fac_cols, newey_west_lags)
+            frames.append(
+                premia.filter(pl.col("factor").is_in(["const", *sector[sub]]))
+                .with_columns(sub_universe=pl.lit(sub))
+            )
+        if not frames:
+            return pl.DataFrame(schema=_FM_SCHEMA)
+    else:
+        for sub, applic in SUBUNIVERSES.items():
+            fac_cols = applicable_factor_columns(scores, applic)
+            # Within a sub-universe the applicable factors form a dense design; drop
+            # only rows still carrying a null (e.g. a loading's warm-up window).
+            sub_df = df.filter(subuniverse_mask(sub, universe_col)).drop_nulls(["_y", *fac_cols])
+            premia = _fama_macbeth_premia(sub_df, fac_cols, newey_west_lags)
+            frames.append(premia.with_columns(sub_universe=pl.lit(sub)))
 
     return pl.concat(frames, how="vertical").select(*_FM_SCHEMA)
 
