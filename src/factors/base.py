@@ -9,6 +9,12 @@ of the pipeline needs to treat factors polymorphically:
                        (systematic: mu_k = beta_k * z_k ; behavioural: mu = IC * sigma * z).
 * ``applicability`` -- which subuniverse the factor is defined on
                        (all-financials / banks / insurance).
+* ``neutralize``    -- whether the score is residualised against the non-style
+                       design (validation.neutralization). False for the
+                       structural-beta signals: they are *explicit* bets on that
+                       design, and a stacked beta is exactly collinear with its
+                       expanded ``beta_{g}`` block, so residualising would
+                       annihilate the signal. Regularization still applies.
 
 Concrete factors implement `compute()` to return raw cross-sectional scores;
 neutralization and standardization happen downstream so factors stay declarative.
@@ -43,6 +49,7 @@ class Factor:
     sleeve: str = ""
     kind: FactorKind = FactorKind.SYSTEMATIC
     applicability: Applicability = Applicability.ALL_FINANCIALS
+    neutralize: bool = True
 
     def compute(self, panel, cfg):
         """Return raw (pre-neutralization) cross-sectional factor scores."""

@@ -11,6 +11,10 @@ Three tiers of applicability, each in its own module:
 * :mod:`yield_curve`    -- interest-rate sensitivities across all three tiers:
   Return sensitivity (all-financials), NIM sensitivity (banks), FIY sensitivity
   (insurance).
+* :mod:`structural_beta` -- the structural loadings traded as signals
+  (betting-against-beta): Market and Country beta (all-financials), Industry
+  beta (per sector). Exempt from neutralization (``neutralize = False``) and,
+  unlike the other style factors, computed from the **market frame**.
 
 Every factor is a :class:`~src.factors.base.Factor` subclass registered via
 ``@register``; each returns a long ``[stock_id, date, <shorthand>]`` frame of raw
@@ -20,4 +24,10 @@ three submodules, which is what populates the registry.
 
 from __future__ import annotations
 
-from . import all_financials, banks, insurance, yield_curve  # noqa: F401  (registration side-effect)
+from . import (  # noqa: F401  (registration side-effect)
+    all_financials,
+    banks,
+    insurance,
+    structural_beta,
+    yield_curve,
+)
