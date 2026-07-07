@@ -12,9 +12,22 @@ columns this module attaches.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 from nelson_siegel_svensson.calibrate import betas_ns_ols
+
+# Currency-transition (difference-in-differences) study results, keyed by
+# (cohort, currency, outcome). Resolved relative to this module -- not the CWD
+# -- so the correction loads whether the pipeline runs from the repo root or
+# from ``notebooks/``.
+_DID_RESULTS_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "data"
+    / "processed"
+    / "yield_curve_did_results.feather"
+)
 
 
 def _tenor_to_years(col: pl.Expr) -> pl.Expr:
@@ -145,8 +158,46 @@ def fit_simple_level_slope(zero_curve, cfg=None):
 # ── Panel enrichment (build-time, so the factors stay IO-free) ────────────────
 
 
+def _did_correction_exprs(coef_col: str) -> list[pl.Expr]:
+    """Build ``level``/``slope`` correction expressions from the DiD results.
+
+    Reads :data:`_DID_RESULTS_PATH` and, for every (``cohort``, ``currency``,
+    ``outcome``) triple, subtracts that triple's ``coef_col`` coefficient from
+    the currency's ``outcome`` column on all dates from ``cohort`` onwards
+    (inclusive). ``coef_col`` selects which set of coefficients to apply --
+    ``"nelson_siegel"`` or ``"simple"``.
+
+    The returned expressions read the panel's ``currency_code`` and ``date``
+    columns (both retained through the enrichment join), so applying them via
+    ``with_columns`` keeps the enrichment lazy. Currencies with no matching row,
+    dates before a cohort, and rows whose ``outcome`` is null are left untouched;
+    coefficients accumulate additively when a currency has more than one cohort.
+    """
+    did = pl.read_ipc(_DID_RESULTS_PATH)
+
+    exprs: list[pl.Expr] = []
+    for outcome in ("level", "slope"):
+        adjustment = pl.lit(0.0)
+        for row in did.filter(pl.col("outcome") == outcome).iter_rows(named=True):
+            coef = row[coef_col]
+            if coef is None:
+                continue
+            in_cohort = (pl.col("currency_code") == row["currency"]) & (
+                pl.col("date") >= row["cohort"]
+            )
+            adjustment = adjustment + pl.when(in_cohort).then(pl.lit(coef)).otherwise(
+                pl.lit(0.0)
+            )
+        exprs.append((pl.col(outcome) - adjustment).alias(outcome))
+    return exprs
+
+
 def attach_nelson_siegel(panel, ns_params):
     """Left-join the fitted NS ``level``/``slope``/``curvature`` onto the panel.
+
+    After the join the ``level``/``slope`` columns are corrected for currency
+    transitions using the Nelson-Siegel DiD coefficients (see
+    :func:`_did_correction_exprs`).
     """
     lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
     nsp = ns_params.lazy() if isinstance(ns_params, pl.DataFrame) else ns_params
@@ -156,7 +207,7 @@ def attach_nelson_siegel(panel, ns_params):
         left_on=["date", "currency_code"],
         right_on=["date", "currency"],
         how="left",
-    )
+    ).with_columns(_did_correction_exprs("nelson_siegel"))
     return out.collect() if isinstance(panel, pl.DataFrame) else out
 
 
@@ -166,6 +217,8 @@ def attach_simple_level_slope(panel, simple_params):
     Curvature-free counterpart to :func:`attach_nelson_siegel`; uses the same
     ``level``/``slope`` column names so it is a drop-in replacement when
     robustness-checking the wider pipeline against the Nelson-Siegel enrichment.
+    The attached ``level``/``slope`` are corrected for currency transitions using
+    the ``simple`` DiD coefficients (see :func:`_did_correction_exprs`).
     """
     lf = panel.lazy() if isinstance(panel, pl.DataFrame) else panel
     sp = simple_params.lazy() if isinstance(simple_params, pl.DataFrame) else simple_params
@@ -175,5 +228,5 @@ def attach_simple_level_slope(panel, simple_params):
         left_on=["date", "currency_code"],
         right_on=["date", "currency"],
         how="left",
-    )
+    ).with_columns(_did_correction_exprs("simple"))
     return out.collect() if isinstance(panel, pl.DataFrame) else out
