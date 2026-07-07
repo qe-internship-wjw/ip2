@@ -67,7 +67,7 @@ def clean(panel, cfg):
     return panel
 
 
-def rebalance_grid(panel, cfg):
+def rebalance_grid(panel, cfg, period_months=None):
     """Per (security, rebalancing period) the period-end trading date + period key.
 
     Buckets each security's trading days into non-overlapping calendar periods of
@@ -75,8 +75,12 @@ def rebalance_grid(panel, cfg):
     last trading day of each -- the rebalance date. Returns a lazy ``[stock_id,
     date, period]`` frame: the grid used by :func:`to_rebalance` to downsample the
     daily style scores and the monthly loadings to the rebalancing cross-sections.
+
+    ``period_months`` overrides the config frequency -- the risk model estimates
+    its factor returns on **monthly** cross-sections (``period_months=1``) while
+    the rebalance itself stays quarterly (see PORTFOLIO_PLAN.md §2).
     """
-    pm = int(cfg.get("backtest", {}).get("rebalancing_frequency_months", 3))
+    pm = int(period_months or cfg.get("backtest", {}).get("rebalancing_frequency_months", 3))
     lf = panel if isinstance(panel, pl.LazyFrame) else panel.lazy()
     return (
         lf.select("stock_id", "date")
