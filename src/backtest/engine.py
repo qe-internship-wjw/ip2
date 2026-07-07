@@ -71,10 +71,27 @@ class BacktestInputs:
 
 
 @dataclass
+class EngineState:
+    """Book + risk-EMA state carried across segmented runs (regime boundaries).
+
+    ``prev_book`` is the drifted post-P&L book of the last traded rebalance
+    (``stock_id -> weight``); ``risk_state`` is the factor-labelled
+    :class:`~src.portfolio.risk_model.RiskState`. Thread a segment's final
+    state into the next segment's ``initial_state`` so the first rebalance
+    there trades *against* the carried book (turnover charged on the change)
+    instead of rebuilding from cash, and the risk EMA stays continuous.
+    """
+
+    prev_book: dict = field(default_factory=dict)
+    risk_state: object | None = None
+
+
+@dataclass
 class BacktestResult:
     results: pl.DataFrame        # one row per traded rebalance (see `run`)
     weights: pl.DataFrame        # [period, stock_id, weight]
     diagnostics: list = field(default_factory=list)
+    state: EngineState | None = None  # final state (segmented-run threading)
 
 
 def _add_months(d: dt.date, k: int) -> dt.date:
@@ -100,8 +117,22 @@ def _ir_series(ic_series, cfg):
     ).select("period", "factor", "ir")
 
 
-def run(inputs: BacktestInputs, cfg, solver_opts=None) -> BacktestResult:
+def run(
+    inputs: BacktestInputs,
+    cfg,
+    solver_opts=None,
+    *,
+    start_period=None,
+    end_period=None,
+    initial_state: EngineState | None = None,
+) -> BacktestResult:
     """Run the walk-forward backtest; see the module docstring for the loop.
+
+    ``start_period`` / ``end_period`` (inclusive period keys) bound the
+    rebalance iteration so a long run can be split at regime boundaries;
+    ``initial_state`` threads the previous segment's drifted book and risk-EMA
+    state in (see :class:`EngineState`). A monolithic run and the equivalent
+    segmented runs with threaded state produce identical results.
 
     Returns a :class:`BacktestResult` whose ``results`` frame has one row per
     traded rebalance: ``[period, date, gross_ret, tc_trade, tc_exit, tc,
@@ -109,7 +140,8 @@ def run(inputs: BacktestInputs, cfg, solver_opts=None) -> BacktestResult:
     n_return_gaps, mkt_beta]`` -- ``gross_ret``/``net_ret`` are realized over
     the *following* period; ``mkt_beta`` is the ex-ante portfolio market
     loading (null when the exposures carry no ``MKT`` column) for the
-    accounting-only hedge in :mod:`.metrics`.
+    accounting-only hedge in :mod:`.metrics`. ``result.state`` holds the final
+    :class:`EngineState` for the next segment.
     """
     pm = int(cfg.get("backtest", {}).get("rebalancing_frequency_months", 3))
     idio_min_obs = int(
@@ -148,9 +180,15 @@ def run(inputs: BacktestInputs, cfg, solver_opts=None) -> BacktestResult:
     periods = sorted(
         set(neu["period"].to_list()) & set(realized["period"].to_list())
     )
+    if start_period is not None:
+        periods = [t for t in periods if t >= start_period]
+    if end_period is not None:
+        periods = [t for t in periods if t <= end_period]
 
-    prev_book: dict[str, float] = {}
-    state = None
+    prev_book: dict[str, float] = (
+        dict(initial_state.prev_book) if initial_state is not None else {}
+    )
+    state = initial_state.risk_state if initial_state is not None else None
     rows, weight_rows, diags = [], [], []
 
     for t in periods:
@@ -316,4 +354,5 @@ def run(inputs: BacktestInputs, cfg, solver_opts=None) -> BacktestResult:
         results=pl.DataFrame(rows),
         weights=pl.DataFrame(weight_rows),
         diagnostics=diags,
+        state=EngineState(prev_book=dict(prev_book), risk_state=state),
     )

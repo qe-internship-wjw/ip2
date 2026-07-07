@@ -32,7 +32,7 @@ from functools import reduce
 import numpy as np
 import polars as pl
 
-from ..factors.base import FactorKind, registry
+from ..factors.base import Applicability, FactorKind, registry
 from ..validation._common import (
     SUBUNIVERSES,
     applicable_factor_columns,
@@ -64,8 +64,7 @@ def strategic_weights(factors, cfg, ir=None):
     """Strategic factor weights ``alpha_k``.
 
     ``portfolio.strategic_allocation: equal`` -> ``1/K``; ``ir_weighted`` ->
-    ``ir_k / sum|ir|`` (signed, gross-normalized -- a negatively priced factor is
-    tilted against), requiring an ``ir`` mapping ``factor -> IR``.
+    ``|ir_k| / sum|ir|``, requiring an ``ir`` mapping ``factor -> IR``.
     """
     factors = list(factors)
     if not factors:
@@ -79,7 +78,7 @@ def strategic_weights(factors, cfg, ir=None):
         gross = sum(abs(ir.get(f, 0.0)) for f in factors)
         if gross == 0:
             return {f: 1.0 / len(factors) for f in factors}
-        return {f: ir.get(f, 0.0) / gross for f in factors}
+        return {f: abs(ir.get(f, 0.0)) / gross for f in factors}
     raise ValueError(f"unknown strategic_allocation '{method}'")
 
 
@@ -103,7 +102,7 @@ def integrate(per_factor_mu, alpha):
 
 def premia_series(scores, fwd_returns, *, delist_events, target_col="excess_return",
                   period_months=3, winsorize_limits=(0.01, 0.99),
-                  universe_col="industry"):
+                  universe_col="industry", pooled=False):
     """Per-period Fama-MacBeth cross-sectional coefficients, per sub-universe.
 
     The same per-period regression as :func:`src.validation.single_factor.
@@ -112,6 +111,16 @@ def premia_series(scores, fwd_returns, *, delist_events, target_col="excess_retu
     series. Each period's coefficient uses only that period's cross-section and
     the return realised one period ahead, so the series is point-in-time by
     construction. ``delist_events`` threads the survivorship fix into the target.
+
+    ``pooled=True`` mirrors ``fama_macbeth(pooled=True)``: each factor's
+    coefficient is estimated **once, on the universe it is applicable to** --
+    all-financials factors on the pooled cross-section (``sub_universe="all"``,
+    sector factors zero-filled off-sector as controls), sector factors on their
+    own sub-universe (all-financials factors as controls). The traded beliefs
+    then match the selection tests (DYNAMIC_SELECTION_PLAN.md §1.5);
+    :func:`expected_return_cross_section` applies an ``"all"`` premium to every
+    row. ``pooled=False`` is the legacy two-estimates-per-all-financials-factor
+    architecture.
 
     Returns ``[period, sub_universe, factor, coef]`` (``const`` included).
     """
@@ -138,10 +147,43 @@ def premia_series(scores, fwd_returns, *, delist_events, target_col="excess_retu
     else:
         raise ValueError("premia_series: scores needs a 'date' or 'period' column.")
 
+    # (sub_universe label, row mask, regressors, reported factors, zero-fill exprs)
+    runs = []
+    if pooled:
+        all_fin = applicable_factor_columns(scores, (Applicability.ALL_FINANCIALS,))
+        sector_cols = {
+            "bank": applicable_factor_columns(scores, (Applicability.BANKS,)),
+            "insurance": applicable_factor_columns(scores, (Applicability.INSURANCE,)),
+        }
+        if all_fin:
+            zero_off_sector = [
+                pl.when(subuniverse_mask(sub, universe_col))
+                .then(pl.col(c)).otherwise(0.0).alias(c)
+                for sub, cols in sector_cols.items() for c in cols
+            ]
+            pooled_mask = subuniverse_mask("bank", universe_col) | subuniverse_mask(
+                "insurance", universe_col
+            )
+            fac = all_fin + [c for cols in sector_cols.values() for c in cols]
+            runs.append(("all", pooled_mask, fac, ["const", *all_fin], zero_off_sector))
+        for sub, applic in SUBUNIVERSES.items():
+            if sector_cols[sub]:
+                runs.append((
+                    sub, subuniverse_mask(sub, universe_col),
+                    applicable_factor_columns(scores, applic),
+                    ["const", *sector_cols[sub]], None,
+                ))
+    else:
+        for sub, applic in SUBUNIVERSES.items():
+            fac_cols = applicable_factor_columns(scores, applic)
+            runs.append((sub, subuniverse_mask(sub, universe_col), fac_cols, None, None))
+
     frames = []
-    for sub, applic in SUBUNIVERSES.items():
-        fac_cols = applicable_factor_columns(scores, applic)
-        sub_df = df.filter(subuniverse_mask(sub, universe_col)).drop_nulls(["_y", *fac_cols])
+    for sub, mask, fac_cols, reported, zero_fill in runs:
+        sub_df = df.filter(mask)
+        if zero_fill:
+            sub_df = sub_df.with_columns(zero_fill)
+        sub_df = sub_df.drop_nulls(["_y", *fac_cols])
         if sub_df.height == 0 or not fac_cols:
             continue
         coef = (
@@ -152,7 +194,7 @@ def premia_series(scores, fwd_returns, *, delist_events, target_col="excess_retu
             )
             .over("period")
         )
-        frames.append(
+        series = (
             sub_df.select("period", _coef=coef)
             .unique(subset="period", keep="first")
             .sort("period")
@@ -160,6 +202,9 @@ def premia_series(scores, fwd_returns, *, delist_events, target_col="excess_retu
             .unpivot(index="period", variable_name="factor", value_name="coef")
             .with_columns(sub_universe=pl.lit(sub))
         )
+        if reported is not None:
+            series = series.filter(pl.col("factor").is_in(reported))
+        frames.append(series)
     if not frames:
         raise ValueError("premia_series: no sub-universe produced a coefficient series.")
     return (
@@ -350,8 +395,12 @@ def expected_return_cross_section(neu_t, premia_t, ic_t, sigma, cfg, alpha=None,
                 continue  # no usable IC yet: no view
             term = pl.lit(a * ic[f]) * pl.col("_sigma") * pl.col(f)
         else:
-            lam_b = lam.get(("bank", f))
-            lam_i = lam.get(("insurance", f))
+            # A pooled ("all") premium applies to every row; a sub-universe
+            # premium overrides it on its own rows (pooled premia_series emits
+            # exactly one of the two per factor -- legacy emits per-sub only).
+            lam_all = lam.get(("all", f))
+            lam_b = lam.get(("bank", f), lam_all)
+            lam_i = lam.get(("insurance", f), lam_all)
             if lam_b is None and lam_i is None:
                 continue  # no usable premium yet: no view
             lam_expr = (

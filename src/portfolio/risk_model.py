@@ -130,6 +130,23 @@ def ema_update(prev_cov, new_cov, coef):
 
 
 @dataclass
+class RiskState:
+    """EMA state threaded between rebalances, keyed by factor identity.
+
+    ``factors`` labels the rows/columns of ``F`` so a later :func:`estimate`
+    with a *different* factor set (dynamic re-selection) aligns by **name**:
+    surviving factors keep their EMA history, entries involving a new factor
+    seed at the fresh windowed estimate, and a factor swap at equal K never
+    blends the covariances of two different factors. ``D`` is the per-name
+    ``[stock_id, _d]`` idio frame (already a name-keyed join downstream).
+    """
+
+    factors: list
+    F: np.ndarray
+    D: pl.DataFrame
+
+
+@dataclass
 class RiskModel:
     """Structured covariance at one rebalance, in rebalance-period return units.
 
@@ -150,9 +167,13 @@ class RiskModel:
         return np.sqrt(np.maximum(self.D, 0.0))
 
     @property
-    def state(self):
-        """EMA state ``(F, [stock_id, _d])`` to thread into the next :func:`estimate`."""
-        return self.F, pl.DataFrame({"stock_id": self.stock_ids, "_d": self.D})
+    def state(self) -> RiskState:
+        """Factor-labelled EMA state to thread into the next :func:`estimate`."""
+        return RiskState(
+            factors=list(self.factors),
+            F=self.F,
+            D=pl.DataFrame({"stock_id": self.stock_ids, "_d": self.D}),
+        )
 
     def covariance(self) -> np.ndarray:
         """Materialize the full N x N Sigma (tests / diagnostics only)."""
@@ -177,7 +198,11 @@ def estimate(exposures, factor_rets, residuals, cfg, state=None, by="period"):
         **already sliced to periods <= t by the caller** (point-in-time contract).
     cfg : reads ``portfolio.risk_model.*``, ``portfolio.covariance.ema_coefficient``
         and ``backtest.rebalancing_frequency_months`` (monthly -> quarterly scaling).
-    state : ``RiskModel.state`` of the previous rebalance, or None to seed.
+    state : ``RiskModel.state`` (a :class:`RiskState`) of the previous rebalance, or
+        None to seed. When the factor set changed since, ``F`` is aligned by factor
+        *name* -- surviving factors keep their EMA, new ones seed at the fresh
+        windowed estimate. A legacy unlabelled ``(F, d_frame)`` tuple is still
+        accepted (shape-checked reseed only).
 
     Returns a :class:`RiskModel`; shrinkage intensities and observation counts land
     in ``meta``.
@@ -233,10 +258,36 @@ def estimate(exposures, factor_rets, residuals, cfg, state=None, by="period"):
     s2_hat, delta_d = shrink_idio(d0["s2"].to_numpy(), d0["n"].to_numpy())
 
     # ── EMA against the previous state, then monthly -> rebalance-period units ──
-    f_prev, d_prev = state if state is not None else (None, None)
-    if f_prev is not None and np.shape(f_prev) != f_hat.shape:
-        f_prev = None  # factor set changed: reseed rather than mix bases
-    F = ema_update(f_prev, f_hat * scale, ema)
+    if state is None:
+        f_labels, f_prev, d_prev = None, None, None
+    elif isinstance(state, RiskState):
+        f_labels, f_prev, d_prev = state.factors, state.F, state.D
+    else:  # legacy (F, d_frame) tuple: factor identities unknown
+        f_prev, d_prev = state
+        f_labels = None
+
+    new = f_hat * scale
+    if f_prev is None:
+        F = new
+    elif f_labels is not None:
+        # Align the previous F by factor name: a factor-set change (dynamic
+        # re-selection) must never blend the covariances of different factors,
+        # even when K happens to match. Entries whose factors both survive keep
+        # their EMA; entries involving a new factor seed at the fresh estimate.
+        idx = {f: i for i, f in enumerate(f_labels)}
+        pos = [(i, idx[f]) for i, f in enumerate(order) if f in idx]
+        aligned = np.full_like(new, np.nan)
+        if pos:
+            pos_new, pos_old = zip(*pos)
+            aligned[np.ix_(pos_new, pos_new)] = np.asarray(f_prev, dtype=float)[
+                np.ix_(pos_old, pos_old)
+            ]
+        F = np.where(np.isnan(aligned), new, ema * aligned + (1.0 - ema) * new)
+        F = (F + F.T) / 2.0  # exact symmetry after the mixed blend
+    elif np.shape(f_prev) == new.shape:
+        F = ema_update(f_prev, new, ema)
+    else:
+        F = new  # legacy unlabelled state with changed shape: reseed
 
     d_new = d0.with_columns(pl.Series("_d_new", s2_hat * scale)).select("stock_id", "_d_new")
     if d_prev is not None:
