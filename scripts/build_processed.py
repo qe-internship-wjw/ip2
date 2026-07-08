@@ -91,6 +91,30 @@ def _materialize(lf: pl.LazyFrame, path: Path) -> pl.LazyFrame:
     return pl.scan_ipc(path)
 
 
+# Transient audit columns emitted by preprocess.clean (RETURNS_DATA_QUALITY.md).
+_SCRUB_AUDIT_COLS = ("_px_blanked", "_ret_gated")
+
+
+def _log_scrub(scan: pl.LazyFrame, label: str) -> pl.LazyFrame:
+    """Log how many rows each data-quality gate touched, then drop the audit cols.
+
+    The counts are read straight from the already-materialized feather (a cheap
+    columnar sum, no re-execution of the join graph), keeping the scrub auditable
+    without a second pass.
+    """
+    counts = scan.select(
+        n=pl.len(),
+        n_price_blanked=pl.col("_px_blanked").sum(),
+        n_return_gated=pl.col("_ret_gated").sum(),
+    ).collect().row(0, named=True)
+    _log(
+        f"{label} scrub: blanked {counts['n_price_blanked']:,} sub-floor prices, "
+        f"gated {counts['n_return_gated']:,} impossible returns "
+        f"(of {counts['n']:,} rows)"
+    )
+    return scan.drop(_SCRUB_AUDIT_COLS)
+
+
 def build_panels(cfg, tmp_dir: Path):
     """Cleaned full-universe market frame + sector panel (materialized) and
     the delisting events of the tradeable set, all unfiltered."""
@@ -99,11 +123,13 @@ def build_panels(cfg, tmp_dir: Path):
         preprocess.clean(joins.build_market_frame(raw, cfg), cfg),
         tmp_dir / "market_frame.feather",
     )
+    market_frame = _log_scrub(market_frame, "market frame")
     _log("market frame materialized")
     sector_panel = _materialize(
         preprocess.clean(joins.build_sector_panel(raw, cfg), cfg),
         tmp_dir / "sector_panel.feather",
     )
+    sector_panel = _log_scrub(sector_panel, "sector panel")
     _log("sector panel materialized")
     events = delisting.delist_events(
         raw["price"].join(universe.tradable_ids(raw, cfg), on="stock_id", how="semi"),

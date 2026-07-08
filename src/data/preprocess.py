@@ -23,43 +23,120 @@ _APPLICABILITY_PREFIX = {
 def clean(panel, cfg):
     """Repair null and erroneous raw values prior to factor generation.
 
+    The raw vendor feed carries physically-impossible returns -- both directly
+    (a ``total_return`` of +1,999,900%) and latently, as vanishingly small
+    "prices" (a near-delisting / relisting stub of a fraction of a cent) that
+    manufacture thousand-percent moves the moment they anchor a ratio
+    (RETURNS_DATA_QUALITY.md). Left alone they flow into ``ret_raw``, the
+    cap-weighted market series, and the return-derived style factors
+    (volatility, momentum), so the scrub operates on ``total_return`` itself --
+    upstream of every one of them.
+
     Steps applied in order:
-      1. Impute null total_return:
-           - genuine price change (corporate action) → price_local / prev_price_local - 1
-           - stale price or no price data            → 0
-      2. Drop rows where risk_free_rate is null (SG/KR/TW before their
+      1. **Price-validity gate.** A mark below ``preprocess.min_price_usd``
+         (converted to USD via ``fx_to_usd``), non-positive, or non-finite is a
+         vendor stub, not a tradeable price. It is blanked so it can never
+         anchor a return -- neither as the current mark nor as a later row's
+         previous mark -- which neutralises a near-zero round-trip (stub → back)
+         end to end.
+      2. **Impute null total_return** across *trustworthy* fills only:
+           - the vendor ``price_return`` when present (never null with a null
+             ``total_return`` in practice, but the correct preference);
+           - else ``price_local / prev_price − 1``, but only when both marks are
+             valid (step 1) and no more than ``preprocess.max_impute_gap_days``
+             apart -- a wider gap spans a halt / relisting / unadjusted action
+             whose raw ratio is not a one-day return;
+           - else 0 (stale price, untrustworthy gap, or no usable price).
+      3. **Return-validity gate.** After imputation, a return that spans a
+         blanked stub, is non-finite, or exceeds ``preprocess.max_abs_daily_return``
+         in magnitude is a data error: null it and book the day flat (``0``).
+         This is a validity gate, not a winsorization -- it removes impossible
+         values while leaving legitimate tails (incl. the −100% delisting
+         settlement, applied downstream) intact.
+      4. Drop rows where risk_free_rate is null (SG/KR/TW before their
          rate series begins; ~2% of rows, ~3.1M).
-      3. Recompute excess_return from the now-complete total_return.
+      5. Recompute excess_return from the now-clean total_return.
+
+    ``_px_blanked`` / ``_ret_gated`` boolean columns ride along so a caller
+    (``scripts.build_processed``) can log how many rows each gate touched; they
+    are transient and ignored by every downstream consumer.
     """
+    pcfg = cfg.get("preprocess", {}) or {}
+    min_price_usd = pcfg.get("min_price_usd")
+    max_gap_days = pcfg.get("max_impute_gap_days")
+    max_abs_ret = pcfg.get("max_abs_daily_return")
+
     # Sort required for shift(1).over() to produce the chronological lag.
     panel = panel.sort(["stock_id", "date"])
 
-    # ── 1. Impute null total_return ───────────────────────────────────────
-    panel = (
-        panel
-        .with_columns(
-            pl.col("price_local").shift(1).over("stock_id").alias("_prev_price")
+    # ── 1. Price-validity gate (USD floor + basic sanity) ─────────────────
+    valid_price = (
+        pl.col("price_local").is_not_null()
+        & pl.col("price_local").is_finite()
+        & (pl.col("price_local") > 0.0)
+    )
+    if min_price_usd is not None:
+        price_usd = pl.col("price_local") * pl.col("fx_to_usd")
+        # A null price_usd means fx is missing, not that the price is tiny -- keep
+        # the basic-sanity verdict and let the USD floor apply only when convertible.
+        valid_price = valid_price & (
+            price_usd.is_null() | (price_usd >= float(min_price_usd))
         )
-        .with_columns(
-            pl.when(
-                pl.col("total_return").is_null()
-                & pl.col("price_local").is_not_null()
-                & pl.col("_prev_price").is_not_null()
-                & (pl.col("price_local") != pl.col("_prev_price"))
-            )
-            .then(pl.col("price_local") / pl.col("_prev_price") - 1.0)
-            .when(pl.col("total_return").is_null())
-            .then(pl.lit(0.0))
-            .otherwise(pl.col("total_return"))
-            .alias("total_return")
-        )
-        .drop("_prev_price")
+    panel = panel.with_columns(
+        _orig_tr_nonnull=pl.col("total_return").is_not_null(),
+        _valid_price=valid_price,
+    )
+    # The validated mark (null on a stub) plus its lagged value / date / validity.
+    # The lag is null exactly when the previous mark was itself a stub, so a stub
+    # can never sit on either end of an imputed one-day return.
+    panel = panel.with_columns(
+        _px=pl.when("_valid_price").then(pl.col("price_local")).otherwise(None),
+    ).with_columns(
+        _prev_px=pl.col("_px").shift(1).over("stock_id"),
+        _prev_date=pl.col("date").shift(1).over("stock_id"),
+        # First row has no predecessor to span, so treat its "previous" as valid.
+        _prev_valid=pl.col("_valid_price").shift(1).over("stock_id").fill_null(True),
     )
 
-    # ── 2. Remove rows with no risk-free rate ─────────────────────────────
+    # ── 2. Impute null total_return across trustworthy fills only ─────────
+    within_gap = pl.lit(True)
+    if max_gap_days is not None:
+        within_gap = (
+            pl.col("date") - pl.col("_prev_date")
+        ).dt.total_days() <= int(max_gap_days)
+    can_impute = (
+        pl.col("_px").is_not_null()
+        & pl.col("_prev_px").is_not_null()
+        & (pl.col("_px") != pl.col("_prev_px"))
+        & within_gap
+    )
+    panel = panel.with_columns(
+        pl.when(pl.col("total_return").is_null() & pl.col("price_return").is_not_null())
+        .then(pl.col("price_return"))
+        .when(pl.col("total_return").is_null() & can_impute)
+        .then(pl.col("_px") / pl.col("_prev_px") - 1.0)
+        .when(pl.col("total_return").is_null())
+        .then(pl.lit(0.0))
+        .otherwise(pl.col("total_return"))
+        .alias("total_return")
+    )
+
+    # ── 3. Return-validity gate: null impossible values, book them flat ───
+    tr = pl.col("total_return")
+    is_bad = (~pl.col("_valid_price")) | (~pl.col("_prev_valid"))  # spans a stub
+    is_bad = is_bad | (tr.is_not_null() & ~tr.is_finite())         # NaN / inf
+    if max_abs_ret is not None:
+        is_bad = is_bad | (tr.is_not_null() & (tr.abs() > float(max_abs_ret)))
+    panel = panel.with_columns(
+        pl.when(is_bad).then(None).otherwise(tr).fill_null(0.0).alias("total_return"),
+        _px_blanked=~pl.col("_valid_price"),
+        _ret_gated=pl.col("_orig_tr_nonnull") & is_bad,
+    ).drop("_valid_price", "_orig_tr_nonnull", "_px", "_prev_px", "_prev_date", "_prev_valid")
+
+    # ── 4. Remove rows with no risk-free rate ─────────────────────────────
     panel = panel.filter(pl.col("risk_free_rate").is_not_null())
 
-    # ── 3. Recompute excess_return with the filled total_return ───────────
+    # ── 5. Recompute excess_return with the cleaned total_return ──────────
     panel = panel.with_columns(
         excess_return=(pl.col("total_return") - pl.col("risk_free_rate"))
     )
