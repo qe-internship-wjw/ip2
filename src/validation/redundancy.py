@@ -276,15 +276,31 @@ def _lasso_survivors(df, cols):
 def _lasso_coefficients(X: np.ndarray, y: np.ndarray, periods: np.ndarray) -> np.ndarray:
     """Cross-validated lasso coefficients, cross-validating by period.
 
-    Folds group whole rebalancing periods together (``GroupKFold`` on ``periods``)
-    so a period's cross-section never straddles the train/test split -- otherwise
-    contemporaneous rows leak and the alpha selection is over-optimistic.
+    Folds group whole rebalancing periods together so a period's cross-section 
+    never straddles the train/test split, preventing cross-sectional leakage.
     """
     from sklearn.linear_model import LassoCV
-    from sklearn.model_selection import GroupKFold
-
-    n_splits = min(5, len(np.unique(periods)))
+    from sklearn.model_selection import TimeSeriesSplit
+    unique_periods = np.sort(np.unique(periods))
+    n_splits = min(5, len(unique_periods))
+    
     if n_splits < 2:
         return np.zeros(X.shape[1])
-    cv = list(GroupKFold(n_splits=n_splits).split(X, y, periods))
+        
+    # 1. Split on the unique periods, not the raw data
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    cv = []
+    
+    for train_period_idx, test_period_idx in tscv.split(unique_periods):
+        # 2. Identify the actual periods for this fold
+        train_periods = unique_periods[train_period_idx]
+        test_periods = unique_periods[test_period_idx]
+        
+        # 3. Map the periods back to the original row indices in X
+        train_idx = np.where(np.isin(periods, train_periods))[0]
+        test_idx = np.where(np.isin(periods, test_periods))[0]
+        
+        cv.append((train_idx, test_idx))
+
+    # 4. Pass the custom cv iterator to LassoCV
     return LassoCV(cv=cv, alphas=50, max_iter=10000).fit(X, y).coef_
