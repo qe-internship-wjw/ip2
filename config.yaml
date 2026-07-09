@@ -22,9 +22,20 @@ universe:
 
 # --- Preprocessing / regularization (after factor generation) -----------------
 preprocess:
-  winsorize_limits: [0.01, 0.99]        
-  standardize: zscore                   
-  group_by: period                      
+  winsorize_limits: [0.01, 0.99]
+  standardize: zscore
+  group_by: period
+  # Raw-return data-quality gates (RETURNS_DATA_QUALITY.md). These scrub
+  # physically-impossible vendor values from `total_return` *before* it feeds
+  # excess_return, ret_raw, the cap-weighted market series, and the
+  # return-derived factors. They remove data errors, not legitimate tails.
+  min_price_usd: 0.10                   # a mark below this (USD, via fx_to_usd) is a
+                                        # vendor stub -> blanked, never anchors a return
+  max_abs_daily_return: 1.0             # |daily total return| above this is a vendor
+                                        # error (financials; +100% intraday is extreme)
+  max_impute_gap_days: 10               # only impute a null return across price marks
+                                        # <= this many days apart (calendar); a wider gap
+                                        # spans a halt/relisting -> booked flat instead
 
 # --- Factors ------------------------------------------------------------------
 factors:
@@ -44,7 +55,7 @@ validation:
     decay_lags: [1, 2, 3, 4]            # IC decay horizons
     ir_shortlist_threshold: 0.2         # single-factor IR gate (|IR| at lag 1)
   fama_macbeth:
-    t_stat_threshold: 1.0               # single-factor FM gate (|Newey-West t|)
+    t_stat_threshold: 1.6               # single-factor FM gate (|Newey-West t|)
   quantiles: 10
   redundancy:
     correlation_threshold: 0.4          # flag factor pairs with |rho| > threshold
@@ -73,7 +84,7 @@ portfolio:
   covariance:
     shrinkage: linear                   # linear (simple Ledoit-Wolf) | nonlinear
     target: diagonal                    # diagonal of sample factor variances (MVO_PARAMETER_ESTIMATION.md)
-    ema_coefficient: 0.94               # slow-moving risk model
+    ema_coefficient: 0.97               # slow-moving risk model
   optimizer:
     solver: null                        # auto: first usable of OSQP/SCS/HIGHS (CLARABEL blocked by app-control policy)
 
